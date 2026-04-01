@@ -33,16 +33,18 @@ if [[ " $* " != *" --resume "* ]]; then
 fi
 ARGS+=(--epochs "$EPOCHS" --save-every "$SAVE_EVERY")
 
+MODELS_DIR="${YALLM_MODELS_DIR:-$SCRIPT_DIR/models}"
+
 echo "Starting instruction fine-tuning in background..."
 echo "  model_name=$MODEL_NAME"
 echo "  args: ${ARGS[*]} $*"
-echo "  Monitor: tail -f models/$MODEL_NAME/status.txt"
+echo "  Monitor: tail -f $MODELS_DIR/$MODEL_NAME/status.txt"
 
-mkdir -p "models/$MODEL_NAME"
+mkdir -p "$MODELS_DIR/$MODEL_NAME"
 
 nohup python -u finetune.py "${ARGS[@]}" "$@" \
-    > "models/$MODEL_NAME/stdout.log" 2> "models/$MODEL_NAME/stderr.log" &
+    > "$MODELS_DIR/$MODEL_NAME/stdout.log" 2> "$MODELS_DIR/$MODEL_NAME/stderr.log" &
 
-echo $! > "models/$MODEL_NAME/.pid"
-echo "PID: $(cat "models/$MODEL_NAME/.pid")"
-echo "To stop: kill \$(cat models/$MODEL_NAME/.pid)"
+echo $! > "$MODELS_DIR/$MODEL_NAME/.pid"
+echo "PID: $(cat "$MODELS_DIR/$MODEL_NAME/.pid")"
+echo "To stop: kill \$(cat $MODELS_DIR/$MODEL_NAME/.pid)"

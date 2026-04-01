@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
 """
 YALLM Pretraining Script
-Pretrain a GPT-2 model from scratch on a text file.
+Train any decoder-only transformer from scratch.
 
-New run:
-  python train.py --model-name my-gpt --data ../the-verdict.txt --epochs 20
+Supports:
+  - Preset architectures: gpt2-124m, llama-1b, llama-3b, mistral-1b, gptj-1b
+  - Custom architecture via JSON config file
+  - Small text files or large pre-tokenized shard datasets
+  - Legacy GPT-2 mode (backward compatible)
 
-Resume:
-  python train.py --model-name my-gpt --resume
+Examples:
+  # Train with a preset
+  python train.py --model-name my-llama --preset llama-1b --data ../the-verdict.txt
+
+  # Train with custom config
+  python train.py --model-name my-model --config configs/custom.json --data ../the-verdict.txt
+
+  # Train on pre-tokenized shards
+  python train.py --model-name my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
+
+  # Resume training
+  python train.py --model-name my-llama --resume
+
+  # Legacy GPT-2 mode (unchanged from before)
+  python train.py --model-name my-gpt --model-size 124M --data ../the-verdict.txt
 """
 
 import argparse
@@ -19,32 +35,20 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+# New architecture imports
+from architecture import ModelConfig, CausalLM, PRESETS, get_preset
+from architecture.generate import generate
+
+# Legacy imports (backward compat)
 from model import (
     GPT2, build_config, get_tokenizer, text_to_token_ids, token_ids_to_text,
-    generate, write_status, set_status_file, get_model_dir, get_status_file,
+    write_status, set_status_file, get_status_file,
     save_model_config, load_model_config, save_checkpoint, load_checkpoint,
-    MODEL_CONFIGS,
+    MODEL_CONFIGS, MODELS_DIR,
 )
 
-
-# ---------------------------------------------------------------------------
-#  Pretraining Dataset
-# ---------------------------------------------------------------------------
-
-class PretrainDataset(Dataset):
-    def __init__(self, txt, tokenizer, window_length, stride):
-        tokens = tokenizer.encode(txt)
-        self.input_tokens = []
-        self.output_tokens = []
-        for i in range(0, len(tokens) - window_length, stride):
-            self.input_tokens.append(torch.tensor(tokens[i:i + window_length]))
-            self.output_tokens.append(torch.tensor(tokens[i + 1:i + 1 + window_length]))
-
-    def __len__(self):
-        return len(self.input_tokens)
-
-    def __getitem__(self, idx):
-        return self.input_tokens[idx], self.output_tokens[idx]
+# Data pipeline
+from pretrain_data.dataset import create_pretrain_dataloaders
 
 
 # ---------------------------------------------------------------------------
@@ -79,18 +83,24 @@ def evaluate(model, train_loader, val_loader, device, eval_iter):
 
 
 # ---------------------------------------------------------------------------
-#  Training loop
+#  Training loop (works with both CausalLM and legacy GPT2)
 # ---------------------------------------------------------------------------
 
-def train(model, train_loader, val_loader, optimizer, device,
-          num_epochs, eval_freq, eval_iter, start_context, tokenizer,
-          model_name, save_every_n_epochs,
-          start_epoch=0, start_global_step=-1, start_tokens_seen=0,
-          prev_train_losses=None, prev_val_losses=None):
+def train_loop(model, train_loader, val_loader, optimizer, device,
+               num_epochs, eval_freq, eval_iter, start_context, tokenizer,
+               model_name, save_every_n_epochs,
+               start_epoch=0, start_global_step=-1, start_tokens_seen=0,
+               prev_train_losses=None, prev_val_losses=None):
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
     tokens_seen = start_tokens_seen
     global_step = start_global_step
+
+    # Get context size from model
+    if hasattr(model, "config"):
+        ctx_size = model.config.context_length
+    else:
+        ctx_size = model.cfg["context_length"]
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -114,10 +124,9 @@ def train(model, train_loader, val_loader, optimizer, device,
 
         # Generate a sample after each epoch
         model.eval()
-        ctx_size = model.cfg["context_length"]
         enc = text_to_token_ids(start_context, tokenizer).to(device)
         with torch.no_grad():
-            gen = generate(model, enc, 50, ctx_size)
+            gen = generate(model, enc, max_new_tokens=50, context_size=ctx_size)
         sample = token_ids_to_text(gen, tokenizer).replace("\n", " ")
         write_status(f"SAMPLE epoch={epoch+1}: {sample}")
         model.train()
@@ -133,13 +142,37 @@ def train(model, train_loader, val_loader, optimizer, device,
     ckpt_path = save_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
         tokens_seen, train_losses, val_losses, tag="final")
-    # Also update latest
     save_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
         tokens_seen, train_losses, val_losses)
     write_status(f"FINAL checkpoint saved -> {ckpt_path}")
 
     return train_losses, val_losses
+
+
+# ---------------------------------------------------------------------------
+#  Model creation helpers
+# ---------------------------------------------------------------------------
+
+def create_model_from_config(config: ModelConfig, device: torch.device) -> CausalLM:
+    """Create a new CausalLM from a ModelConfig."""
+    torch.manual_seed(123)
+    model = CausalLM(config)
+    model.to(device)
+    write_status(f"MODEL created: {config.name}")
+    write_status(model.summary())
+    return model
+
+
+def create_legacy_model(model_size: str, context_length: int,
+                        drop_rate: float, device: torch.device):
+    """Create a legacy GPT2 model (backward compat)."""
+    model_cfg = build_config(model_size, context_length=context_length,
+                             drop_rate=drop_rate)
+    torch.manual_seed(123)
+    model = GPT2(model_cfg)
+    model.to(device)
+    return model, model_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -152,25 +185,42 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # New training run
-  python train.py --model-name verdict-gpt --data ../the-verdict.txt --epochs 20
+  # New architecture presets
+  python train.py --model-name my-llama --preset llama-1b --data ../the-verdict.txt
+  python train.py --model-name my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
 
-  # Resume from latest checkpoint
-  python train.py --model-name verdict-gpt --resume
+  # Custom config file
+  python train.py --model-name my-custom --config my_config.json --data ../the-verdict.txt
 
-  # Resume and train for more epochs
-  python train.py --model-name verdict-gpt --resume --epochs 50
+  # Legacy GPT-2 mode
+  python train.py --model-name verdict-gpt --data ../the-verdict.txt --model-size 124M
+
+  # Resume any model
+  python train.py --model-name my-llama --resume
 """,
     )
+    # Model specification (pick one)
+    model_group = parser.add_argument_group("Model specification (pick one)")
+    model_group.add_argument("--preset", default=None,
+                             choices=list(PRESETS.keys()),
+                             help="Use a preset architecture")
+    model_group.add_argument("--config", default=None,
+                             help="Path to custom model config JSON")
+    model_group.add_argument("--model-size", default=None,
+                             choices=list(MODEL_CONFIGS.keys()),
+                             help="Legacy GPT-2 model size")
+
+    # Common args
     parser.add_argument("--model-name", required=True,
                         help="Name for this model (creates models/<name>/)")
     parser.add_argument("--data", type=str, default=None,
-                        help="Path to training text file (required for new run)")
+                        help="Path to training text file")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Path to pre-tokenized shard directory")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from latest checkpoint")
-    parser.add_argument("--model-size", default="124M",
-                        choices=list(MODEL_CONFIGS.keys()))
-    parser.add_argument("--context-length", type=int, default=256)
+    parser.add_argument("--context-length", type=int, default=None,
+                        help="Override context length (default: from preset/config)")
     parser.add_argument("--epochs", type=int, default=10,
                         help="Total epochs (not additional)")
     parser.add_argument("--batch-size", type=int, default=2)
@@ -181,7 +231,10 @@ Examples:
                         help="Evaluate every N training steps")
     parser.add_argument("--eval-iter", type=int, default=5,
                         help="Number of batches per evaluation")
-    parser.add_argument("--drop-rate", type=float, default=0.1)
+    parser.add_argument("--drop-rate", type=float, default=0.1,
+                        help="Dropout rate (legacy mode)")
+    parser.add_argument("--max-shards", type=int, default=None,
+                        help="Limit number of data shards (for testing)")
     args = parser.parse_args()
 
     # ---- Setup status file ----
@@ -201,20 +254,28 @@ Examples:
         # ---- Resume mode ----
         write_status("RESUME loading config and checkpoint...")
         full_cfg = load_model_config(args.model_name)
-        model_cfg = full_cfg["model"]
         train_cfg = full_cfg["training"]
 
-        # Allow overriding total epochs when resuming
         total_epochs = args.epochs if args.epochs != 10 else train_cfg["epochs"]
-        data_path = train_cfg["data"]
+        data_path = train_cfg.get("data")
+        data_dir = train_cfg.get("data_dir")
 
-        model = GPT2(model_cfg).to(device)
+        # Determine model type from saved config
+        if "architecture" in full_cfg:
+            # New architecture
+            model_config = ModelConfig.from_dict(full_cfg["architecture"])
+            model = CausalLM(model_config).to(device)
+            write_status(f"RESUMED architecture: {model_config.name}")
+        else:
+            # Legacy GPT-2
+            model_cfg = full_cfg["model"]
+            model = GPT2(model_cfg).to(device)
+            write_status("RESUMED legacy GPT-2 architecture")
+
         optimizer = torch.optim.AdamW(model.parameters(),
-                                      lr=train_cfg["lr"],
-                                      weight_decay=0.1)
+                                      lr=train_cfg["lr"], weight_decay=0.1)
         ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
         model.to(device)
-        # Move optimizer state to device
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -233,56 +294,103 @@ Examples:
 
         write_status(f"RESUMED from epoch={start_epoch} step={start_step} "
                      f"tokens={start_tokens} -> training to epoch {total_epochs}")
+
+        # Get context length for data loading
+        if hasattr(model, "config"):
+            context_length = model.config.context_length
+        else:
+            context_length = model.cfg["context_length"]
+        batch_size = train_cfg["batch_size"]
+
     else:
         # ---- New run ----
-        if args.data is None:
-            parser.error("--data is required for a new training run")
+        if args.data is None and args.data_dir is None:
+            parser.error("--data or --data-dir is required for a new training run")
 
-        model_cfg = build_config(args.model_size,
-                                 context_length=args.context_length,
-                                 drop_rate=args.drop_rate)
-        train_cfg = {
-            "data": args.data,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "save_every": args.save_every,
-            "eval_freq": args.eval_freq,
-            "eval_iter": args.eval_iter,
-        }
-        total_epochs = args.epochs
-        data_path = args.data
+        # Determine architecture
+        use_new_arch = args.preset is not None or args.config is not None
 
-        # Save config
-        full_cfg = {"model": model_cfg, "training": train_cfg}
+        if use_new_arch:
+            # New expressive architecture
+            if args.config:
+                model_config = ModelConfig.load(args.config)
+                write_status(f"CONFIG loaded from {args.config}")
+            else:
+                model_config = get_preset(args.preset)
+
+            # Override context length if specified
+            if args.context_length:
+                model_config.context_length = args.context_length
+
+            model = create_model_from_config(model_config, device)
+            context_length = model_config.context_length
+
+            # Save config
+            train_cfg = {
+                "data": args.data,
+                "data_dir": args.data_dir,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "save_every": args.save_every,
+                "eval_freq": args.eval_freq,
+                "eval_iter": args.eval_iter,
+            }
+            full_cfg = {
+                "architecture": model_config.to_dict(),
+                "training": train_cfg,
+            }
+        else:
+            # Legacy GPT-2 mode
+            model_size = args.model_size or "124M"
+            context_length = args.context_length or 256
+            model, model_cfg_dict = create_legacy_model(
+                model_size, context_length, args.drop_rate, device)
+
+            train_cfg = {
+                "data": args.data,
+                "data_dir": args.data_dir,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "save_every": args.save_every,
+                "eval_freq": args.eval_freq,
+                "eval_iter": args.eval_iter,
+            }
+            full_cfg = {"model": model_cfg_dict, "training": train_cfg}
+            write_status(f"LEGACY GPT-2 mode: {model_size}")
+
         save_model_config(args.model_name, full_cfg)
         write_status(f"CONFIG saved to models/{args.model_name}/config.json")
-        write_status(f"MODEL_CFG {model_cfg}")
-        write_status(f"TRAIN_CFG {train_cfg}")
 
-        torch.manual_seed(123)
-        model = GPT2(model_cfg).to(device)
+        total_epochs = args.epochs
+        data_path = args.data
+        data_dir = args.data_dir
+        batch_size = args.batch_size
+
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                       weight_decay=0.1)
         start_epoch, start_step, start_tokens = 0, -1, 0
         prev_tl, prev_vl = [], []
 
     # ---- Load data ----
-    with open(data_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    write_status(f"DATA loaded {len(text)} chars from {data_path}")
+    if data_dir and Path(data_dir).is_dir():
+        # Sharded pre-tokenized data
+        train_loader, val_loader, data_info = create_pretrain_dataloaders(
+            data_dir, seq_len=context_length, batch_size=batch_size,
+            max_shards=args.max_shards,
+        )
+        write_status(f"DATA sharded: {data_info}")
+    elif data_path:
+        # Text file (small dataset)
+        train_loader, val_loader, data_info = create_pretrain_dataloaders(
+            data_path, seq_len=context_length, batch_size=batch_size,
+            tokenizer=tokenizer,
+        )
+        write_status(f"DATA text file: {data_info}")
+    else:
+        parser.error("No data source found. Provide --data or --data-dir.")
 
-    split = int(0.9 * len(text))
-    train_loader = DataLoader(
-        PretrainDataset(text[:split], tokenizer,
-                        model_cfg["context_length"], model_cfg["context_length"]),
-        batch_size=train_cfg["batch_size"] if args.resume else args.batch_size,
-        shuffle=True, drop_last=True)
-    val_loader = DataLoader(
-        PretrainDataset(text[split:], tokenizer,
-                        model_cfg["context_length"], model_cfg["context_length"]),
-        batch_size=train_cfg["batch_size"] if args.resume else args.batch_size,
-        shuffle=False, drop_last=False)
     write_status(f"LOADERS train={len(train_loader)} val={len(val_loader)} batches")
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -290,23 +398,23 @@ Examples:
 
     # ---- Train ----
     t0 = time.time()
-    save_every = train_cfg.get("save_every", args.save_every) if args.resume else args.save_every
-    eval_freq = train_cfg.get("eval_freq", args.eval_freq) if args.resume else args.eval_freq
-    eval_iter = train_cfg.get("eval_iter", args.eval_iter) if args.resume else args.eval_iter
+    save_every = train_cfg.get("save_every", args.save_every)
+    eval_freq = train_cfg.get("eval_freq", args.eval_freq)
+    eval_iter = train_cfg.get("eval_iter", args.eval_iter)
 
-    train(model, train_loader, val_loader, optimizer, device,
-          num_epochs=total_epochs,
-          eval_freq=eval_freq,
-          eval_iter=eval_iter,
-          start_context="Every effort moves you",
-          tokenizer=tokenizer,
-          model_name=args.model_name,
-          save_every_n_epochs=save_every,
-          start_epoch=start_epoch,
-          start_global_step=start_step,
-          start_tokens_seen=start_tokens,
-          prev_train_losses=prev_tl,
-          prev_val_losses=prev_vl)
+    train_loop(model, train_loader, val_loader, optimizer, device,
+               num_epochs=total_epochs,
+               eval_freq=eval_freq,
+               eval_iter=eval_iter,
+               start_context="Every effort moves you",
+               tokenizer=tokenizer,
+               model_name=args.model_name,
+               save_every_n_epochs=save_every,
+               start_epoch=start_epoch,
+               start_global_step=start_step,
+               start_tokens_seen=start_tokens,
+               prev_train_losses=prev_tl,
+               prev_val_losses=prev_vl)
 
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE training completed in {elapsed:.2f} min")

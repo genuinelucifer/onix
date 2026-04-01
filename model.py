@@ -19,7 +19,7 @@ import torch.nn as nn
 EOT_TOKEN = "<" + "|endoftext|" + ">"
 EOT_TOKEN_ID = 50256
 
-MODELS_DIR = Path(__file__).parent / "models"
+MODELS_DIR = Path(os.environ.get("YALLM_MODELS_DIR", Path(__file__).parent / "models"))
 
 
 # ===========================================================================
@@ -198,6 +198,21 @@ def save_checkpoint(model_name, model, optimizer, epoch, global_step,
     if latest.exists() or latest.is_symlink():
         latest.unlink()
     os.symlink(fname, latest)
+    
+    # Keep only the latest 2 epoch checkpoints
+    if tag is None:
+        checkpoints = sorted(
+            [p for p in d.glob("checkpoint_epoch*.pt")],
+            key=lambda p: os.path.getmtime(p)
+        )
+        while len(checkpoints) > 2:
+            old_ckpt = checkpoints.pop(0)
+            if old_ckpt.name != fname:
+                try:
+                    old_ckpt.unlink()
+                except OSError:
+                    pass
+
     return d / fname
 
 
