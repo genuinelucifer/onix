@@ -18,6 +18,9 @@ cd "$SCRIPT_DIR"
 # Activate venv
 source ~/repos/pytorch_env/bin/activate
 
+# Force experimental Flash/Mem-Eff Attention on AMD Consumer GPUs
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+
 MODEL_NAME="${1:?Usage: $0 <model_name> [--preset <preset> | --config <file> | --model-size <size>] [extra args]}"
 shift
 
@@ -25,6 +28,8 @@ shift
 DATA="${DATA:-../the-verdict.txt}"
 EPOCHS="${EPOCHS:-10}"
 SAVE_EVERY="${SAVE_EVERY:-5}"
+EVAL_FREQ="${EVAL_FREQ:-50}"
+LOG_FREQ="${LOG_FREQ:-5}"
 
 MODELS_DIR="${YALLM_MODELS_DIR:-$SCRIPT_DIR/models}"
 
@@ -38,7 +43,7 @@ if [[ " $* " != *" --resume "* ]]; then
         ARGS+=(--data "$DATA")
     fi
 fi
-ARGS+=(--epochs "$EPOCHS" --save-every "$SAVE_EVERY")
+ARGS+=(--epochs "$EPOCHS" --save-every "$SAVE_EVERY" --eval-freq "$EVAL_FREQ" --log-freq "$LOG_FREQ")
 
 echo "Starting pretraining in background..."
 echo "  model_name=$MODEL_NAME"

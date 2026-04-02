@@ -42,6 +42,7 @@ class ModelConfig:
     attn_bias: bool = False
     attn_dropout: float = 0.0
     sliding_window: Optional[int] = None  # None → full attention
+    use_sdpa: bool = True               # Use PyTorch Scaled Dot Product Attention (Flash/Mem-Eff)
 
     # --- Position encoding ---
     pos_encoding: str = "rope"          # "learned" | "rope" | "alibi" | "none"
@@ -59,6 +60,7 @@ class ModelConfig:
 
     # --- Block structure ---
     block_type: str = "sequential"      # "sequential" | "parallel"
+    grad_checkpointing: bool = False    # Use gradient checkpointing to save memory
 
     # --- Embeddings ---
     tie_embeddings: bool = True

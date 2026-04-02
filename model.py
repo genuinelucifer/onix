@@ -199,13 +199,13 @@ def save_checkpoint(model_name, model, optimizer, epoch, global_step,
         latest.unlink()
     os.symlink(fname, latest)
     
-    # Keep only the latest 2 epoch checkpoints
-    if tag is None:
+    # Keep only the latest <4 checkpoints across all epochs/steps (excluding final)
+    if tag != "final":
         checkpoints = sorted(
-            [p for p in d.glob("checkpoint_epoch*.pt")],
+            [p for p in d.glob("checkpoint_*.pt") if "latest" not in p.name and "final" not in p.name],
             key=lambda p: os.path.getmtime(p)
         )
-        while len(checkpoints) > 2:
+        while len(checkpoints) > 3:
             old_ckpt = checkpoints.pop(0)
             if old_ckpt.name != fname:
                 try:

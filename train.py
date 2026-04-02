@@ -87,8 +87,8 @@ def evaluate(model, train_loader, val_loader, device, eval_iter):
 # ---------------------------------------------------------------------------
 
 def train_loop(model, train_loader, val_loader, optimizer, device,
-               num_epochs, eval_freq, eval_iter, start_context, tokenizer,
-               model_name, save_every_n_epochs,
+               num_epochs, log_freq, eval_freq, eval_iter, start_context, tokenizer,
+               model_name, save_every_n_epochs, save_every_n_iters=None,
                start_epoch=0, start_global_step=-1, start_tokens_seen=0,
                prev_train_losses=None, prev_val_losses=None):
     train_losses = list(prev_train_losses or [])
@@ -104,7 +104,12 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
-        for inp, tgt in train_loader:
+        for i, (inp, tgt) in enumerate(train_loader):
+            # Fast-forward resume logic: skip already processed batches in start_epoch
+            current_abs_step = epoch * len(train_loader) + i
+            if current_abs_step <= start_global_step:
+                continue
+
             optimizer.zero_grad()
             loss = calc_loss_batch(inp, tgt, model, device)
             loss.backward()
@@ -112,15 +117,29 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
             tokens_seen += inp.numel()
             global_step += 1
 
+            if global_step % log_freq == 0:
+                write_status(
+                    f"PROGRESS epoch={epoch+1}/{num_epochs} step={global_step:06d} "
+                    f"tokens={tokens_seen} loss={loss.item():.4f}"
+                )
+
             if global_step % eval_freq == 0:
                 tl, vl = evaluate(model, train_loader, val_loader,
                                   device, eval_iter)
                 train_losses.append(tl)
                 val_losses.append(vl)
                 write_status(
-                    f"TRAIN epoch={epoch+1}/{num_epochs} step={global_step:06d} "
+                    f"EVAL epoch={epoch+1}/{num_epochs} step={global_step:06d} "
                     f"tokens={tokens_seen} train_loss={tl:.4f} val_loss={vl:.4f}"
                 )
+
+            # Iteration checkpoint
+            if save_every_n_iters is not None and save_every_n_iters > 0 and global_step > 0:
+                if global_step % save_every_n_iters == 0:
+                    ckpt_path = save_checkpoint(
+                        model_name, model, optimizer, epoch + 1, global_step,
+                        tokens_seen, train_losses, val_losses, tag=f"step{global_step}")
+                    write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
 
         # Generate a sample after each epoch
         model.eval()
@@ -175,6 +194,32 @@ def create_legacy_model(model_size: str, context_length: int,
     return model, model_cfg
 
 
+def create_optimizer(model, opt_name, lr, weight_decay=0.1):
+    """Create optimizer with support for 8-bit variants via bitsandbytes."""
+    opt_name = opt_name.lower()
+    if opt_name == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif opt_name == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif opt_name in ("adamw8bit", "sgd8bit"):
+        try:
+            import bitsandbytes as bnb
+            if opt_name == "adamw8bit":
+                return bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
+            else:
+                # Note: bnb SGD doesn't always support weight_decay in the same way,
+                # but we'll try to keep it consistent.
+                return bnb.optim.SGD8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
+        except ImportError:
+            # Re-wrap error for better UX
+            raise ImportError(
+                f"Optimizer '{opt_name}' requires the 'bitsandbytes' library. "
+                "Please install it with: pip install bitsandbytes"
+            )
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_name}")
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -227,14 +272,30 @@ Examples:
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--save-every", type=int, default=5,
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--eval-freq", type=int, default=5,
-                        help="Evaluate every N training steps")
+    parser.add_argument("--save-iters", type=int, default=0,
+                        help="Save checkpoint every N iterations (0 to disable)")
+    parser.add_argument("--eval-freq", type=int, default=50,
+                        help="Evaluate (train/val loss over multiple batches) every N steps")
+    parser.add_argument("--log-freq", type=int, default=5,
+                        help="Log current batch loss to status.txt every N steps")
     parser.add_argument("--eval-iter", type=int, default=5,
                         help="Number of batches per evaluation")
     parser.add_argument("--drop-rate", type=float, default=0.1,
                         help="Dropout rate (legacy mode)")
     parser.add_argument("--max-shards", type=int, default=None,
                         help="Limit number of data shards (for testing)")
+
+    # Optimization args
+    opt_group = parser.add_argument_group("Optimization & Memory")
+    opt_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
+                           help="Disable SDPA (Flash/Mem-Eff Attention)")
+    opt_group.add_argument("--checkpointing", action="store_true",
+                           help="Enable gradient checkpointing (saves VRAM, slower training)")
+    opt_group.add_argument("--optimizer", default="adamw",
+                           choices=["adamw", "sgd", "adamw8bit", "sgd8bit"],
+                           help="Optimizer to use (default: adamw)")
+    opt_group.set_defaults(use_sdpa=True)
+
     args = parser.parse_args()
 
     # ---- Setup status file ----
@@ -272,8 +333,8 @@ Examples:
             model = GPT2(model_cfg).to(device)
             write_status("RESUMED legacy GPT-2 architecture")
 
-        optimizer = torch.optim.AdamW(model.parameters(),
-                                      lr=train_cfg["lr"], weight_decay=0.1)
+        opt_name = train_cfg.get("optimizer", "adamw")
+        optimizer = create_optimizer(model, opt_name, lr=train_cfg["lr"])
         ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
         model.to(device)
         for state in optimizer.state.values():
@@ -318,9 +379,11 @@ Examples:
             else:
                 model_config = get_preset(args.preset)
 
-            # Override context length if specified
+            # Override context length and memory optimizations if specified
             if args.context_length:
                 model_config.context_length = args.context_length
+            model_config.use_sdpa = args.use_sdpa
+            model_config.grad_checkpointing = args.checkpointing
 
             model = create_model_from_config(model_config, device)
             context_length = model_config.context_length
@@ -333,8 +396,11 @@ Examples:
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "save_every": args.save_every,
+                "save_iters": args.save_iters,
+                "log_freq": args.log_freq,
                 "eval_freq": args.eval_freq,
                 "eval_iter": args.eval_iter,
+                "optimizer": args.optimizer,
             }
             full_cfg = {
                 "architecture": model_config.to_dict(),
@@ -354,8 +420,11 @@ Examples:
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "save_every": args.save_every,
+                "save_iters": args.save_iters,
+                "log_freq": args.log_freq,
                 "eval_freq": args.eval_freq,
                 "eval_iter": args.eval_iter,
+                "optimizer": args.optimizer,
             }
             full_cfg = {"model": model_cfg_dict, "training": train_cfg}
             write_status(f"LEGACY GPT-2 mode: {model_size}")
@@ -368,8 +437,7 @@ Examples:
         data_dir = args.data_dir
         batch_size = args.batch_size
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                      weight_decay=0.1)
+        optimizer = create_optimizer(model, args.optimizer, lr=args.lr)
         start_epoch, start_step, start_tokens = 0, -1, 0
         prev_tl, prev_vl = [], []
 
@@ -399,17 +467,21 @@ Examples:
     # ---- Train ----
     t0 = time.time()
     save_every = train_cfg.get("save_every", args.save_every)
+    save_iters = train_cfg.get("save_iters", args.save_iters)
+    log_freq = train_cfg.get("log_freq", args.log_freq)
     eval_freq = train_cfg.get("eval_freq", args.eval_freq)
     eval_iter = train_cfg.get("eval_iter", args.eval_iter)
 
     train_loop(model, train_loader, val_loader, optimizer, device,
                num_epochs=total_epochs,
+               log_freq=log_freq,
                eval_freq=eval_freq,
                eval_iter=eval_iter,
                start_context="Every effort moves you",
                tokenizer=tokenizer,
                model_name=args.model_name,
                save_every_n_epochs=save_every,
+               save_every_n_iters=save_iters,
                start_epoch=start_epoch,
                start_global_step=start_step,
                start_tokens_seen=start_tokens,

@@ -99,6 +99,7 @@ Create a JSON config file (e.g., `configs/my_arch.json`) to define every layer d
 ---
 
 ## 🛠️ Training Models
+
 ### Running in the Background (Recommended)
 Use the included bash script to run training in the background with `nohup`. It automatically handles logging and PID tracking.
 ```bash
@@ -106,23 +107,59 @@ Use the included bash script to run training in the background with `nohup`. It 
 ```
 - **Logs**: Located in `models/<model_name>/stdout.log` and `stderr.log`.
 - **Status**: Monitor `tail -f models/<model_name>/status.txt`.
-- **Stop**: `kill $(cat models/<model_name>/.pid)`.
+- **Stop**: Use `./stop_train.sh <model_name>`.
 
-### Running Directly via Python
-For debugging or interactive visibility:
+### 🧠 Low-Memory (VRAM/RAM) Optimization
+To train large models (1B+) on consumer GPUs or with limited system RAM, use our optimized 8-bit training configuration:
+
 ```bash
-python train.py --model-name my-model --preset llama-1b --data ../the-verdict.txt
+# Example: 1B Llama model optimized for low-memory & fast status updates
+./run_train.sh llama-1b-fast \
+    --preset llama-1b \
+    --data-dir pretrain_data/tiny_stories/ \
+    --optimizer adamw8bit \
+    --batch-size 8 \
+    --eval-freq 50 \
+    --log-freq 1 \
+    --save-iters 20
+```
+
+#### Key Parameters Explained:
+*   **`--optimizer adamw8bit`**: Uses `bitsandbytes` to quantize optimizer states. Reduces memory usage for optimizer moments by ~75% (e.g., from 8GB down to 2GB for a 1B model).
+*   **`--batch-size 8`**: Increases GPU utilization. Combined with 8-bit optimizers, this allows larger batches in the same VRAM.
+*   **`--log-freq 1`**: Logs a "PROGRESS" line to `status.txt` every single step. Useful for monitoring slow iterations in real-time.
+*   **`--eval-freq 50`**: Runs expensive validation (train/val loss averaging) only every 50 steps to avoid performance bottlenecks.
+*   **`--save-iters 20`**: Saves a checkpoint every 20 steps. Crucial for avoiding lost work if training is interrupted.
+
+---
+
+## 🛑 Managing Background Runs
+If you used `./run_train.sh`, the process runs in the background even if you close your terminal.
+
+### Monitoring Progress
+Use the `train_status.sh` script for a quick summary of progress, potential errors, and the current process state:
+```bash
+# General summary (Status + Errors + PID check)
+./train_status.sh <model_name>
+
+# Real-time view of status logs alone
+tail -f models/<model_name>/status.txt
+```
+
+### Stopping Training Safely
+Use the `stop_train.sh` script to cleanly terminate a model run using its recorded PID:
+```bash
+./stop_train.sh <model_name>
 ```
 
 ### Resuming Training
-To pick up from the latest checkpoint:
+To pick up exactly where you left off after a crash or planned interruption:
 ```bash
-./run_train.sh my-model --resume
+./run_train.sh <model_name> --resume
 ```
-You can also increase the total epochs when resuming:
-```bash
-./run_train.sh my-model --resume --epochs 50
-```
+
+**How it works:**
+The script loads the latest checkpoint and extracts the `global_step` and `tokens_seen`. It then **fast-forwards** the data loader to skip any batches already processed. This ensures you continue with the next unseen sample in your dataset and that your learning rate schedule remains accurate.
 
 ---
 
@@ -134,8 +171,10 @@ export YALLM_MODELS_DIR="/mnt/my_big_drive/models"
 ./run_train.sh my-model ...
 ```
 
-### Checkpoint Retention
-To save disk space, the trainer automatically keeps only the **top 2 most recent checkpoints** + the final model. A 1B parameter model requires ~4GB-10GB per checkpoint.
+### Checkpoint Size & Retention
+*   **Size**: A **llama-1b** checkpoint is approximately **6.7 GB** (4.4GB weights + 2.2GB 8-bit optimizer state).
+*   **Retention**: To save disk space, the trainer automatically keeps only the **top 3 most recent checkpoints** + the final model.
+*   **Budget**: Plan for ~30-40 GB of free space per active training run.
 
 ---
 

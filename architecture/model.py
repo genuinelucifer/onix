@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from .layers import GroupedQueryAttention, FeedForward, build_norm
 
@@ -118,7 +119,11 @@ class CausalLM(nn.Module):
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x)
+            if self.config.grad_checkpointing and self.training:
+                # use_reentrant=False is generally preferred in newer PyTorch
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         # Final norm + LM head
         x = self.final_norm(x)

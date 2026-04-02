@@ -210,7 +210,8 @@ class GroupedQueryAttention(nn.Module):
         # SDPA doesn't natively support ALiBi bias or sliding window with custom masks easily,
         # so we fall back to manual attention for those.
         self._use_sdpa = (
-            hasattr(F, "scaled_dot_product_attention")
+            config.use_sdpa
+            and hasattr(F, "scaled_dot_product_attention")
             and config.pos_encoding != "alibi"
             and config.sliding_window is None
         )
