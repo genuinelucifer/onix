@@ -7,23 +7,20 @@ Supports:
   - Preset architectures: gpt2-124m, llama-1b, llama-3b, mistral-1b, gptj-1b
   - Custom architecture via JSON config file
   - Small text files or large pre-tokenized shard datasets
-  - Legacy GPT-2 mode (backward compatible)
+  - Automatic resuming from latest checkpoints
 
 Examples:
   # Train with a preset
-  python train.py --model-name my-llama --preset llama-1b --data ../the-verdict.txt
+  ./run_train.sh my-llama --preset llama-1b --data ../the-verdict.txt
 
   # Train with custom config
-  python train.py --model-name my-model --config configs/custom.json --data ../the-verdict.txt
+  ./run_train.sh my-model --config configs/custom.json --data ../the-verdict.txt
 
   # Train on pre-tokenized shards
-  python train.py --model-name my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
+  ./run_train.sh my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
 
   # Resume training
-  python train.py --model-name my-llama --resume
-
-  # Legacy GPT-2 mode (unchanged from before)
-  python train.py --model-name my-gpt --model-size 124M --data ../the-verdict.txt
+  ./run_train.sh my-llama --resume
 """
 
 import argparse
@@ -35,16 +32,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-# New architecture imports
+# Modern architecture imports
 from architecture import ModelConfig, CausalLM, PRESETS, get_preset
 from architecture.generate import generate
 
-# Legacy imports (backward compat)
+# Utilities (shared)
 from model import (
-    GPT2, build_config, get_tokenizer, text_to_token_ids, token_ids_to_text,
+    get_tokenizer, text_to_token_ids, token_ids_to_text,
     write_status, set_status_file, get_status_file,
     save_model_config, load_model_config, save_checkpoint, load_checkpoint,
-    MODEL_CONFIGS, MODELS_DIR,
+    MODELS_DIR,
 )
 
 # Data pipeline
@@ -97,10 +94,7 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
     global_step = start_global_step
 
     # Get context size from model
-    if hasattr(model, "config"):
-        ctx_size = model.config.context_length
-    else:
-        ctx_size = model.cfg["context_length"]
+    ctx_size = model.config.context_length
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -183,17 +177,6 @@ def create_model_from_config(config: ModelConfig, device: torch.device) -> Causa
     return model
 
 
-def create_legacy_model(model_size: str, context_length: int,
-                        drop_rate: float, device: torch.device):
-    """Create a legacy GPT2 model (backward compat)."""
-    model_cfg = build_config(model_size, context_length=context_length,
-                             drop_rate=drop_rate)
-    torch.manual_seed(123)
-    model = GPT2(model_cfg)
-    model.to(device)
-    return model, model_cfg
-
-
 def create_optimizer(model, opt_name, lr, weight_decay=0.1):
     """Create optimizer with support for 8-bit variants via bitsandbytes."""
     opt_name = opt_name.lower()
@@ -244,16 +227,15 @@ Examples:
   python train.py --model-name my-llama --resume
 """,
     )
-    # Model specification (pick one)
-    model_group = parser.add_argument_group("Model specification (pick one)")
+    # Model specification
+    model_group = parser.add_argument_group("Model specification")
     model_group.add_argument("--preset", default=None,
                              choices=list(PRESETS.keys()),
-                             help="Use a preset architecture")
+                             help="Use a preset architecture (e.g. llama-1b, gpt2-124m)")
     model_group.add_argument("--config", default=None,
                              help="Path to custom model config JSON")
     model_group.add_argument("--model-size", default=None,
-                             choices=list(MODEL_CONFIGS.keys()),
-                             help="Legacy GPT-2 model size")
+                             help="Legacy compatibility mapping (e.g. 124M -> gpt2-124m)")
 
     # Common args
     parser.add_argument("--model-name", required=True,
@@ -323,15 +305,16 @@ Examples:
 
         # Determine model type from saved config
         if "architecture" in full_cfg:
-            # New architecture
+            # Modern architecture
             model_config = ModelConfig.from_dict(full_cfg["architecture"])
             model = CausalLM(model_config).to(device)
             write_status(f"RESUMED architecture: {model_config.name}")
         else:
-            # Legacy GPT-2
-            model_cfg = full_cfg["model"]
-            model = GPT2(model_cfg).to(device)
-            write_status("RESUMED legacy GPT-2 architecture")
+            # Fallback for old legacy checkpoints
+            raise ValueError(
+                "This trainer no longer supports legacy GPT2 class models. "
+                "Please use a previous version of YALLM or convert the state_dict."
+            )
 
         opt_name = train_cfg.get("optimizer", "adamw")
         optimizer = create_optimizer(model, opt_name, lr=train_cfg["lr"])
@@ -357,10 +340,7 @@ Examples:
                      f"tokens={start_tokens} -> training to epoch {total_epochs}")
 
         # Get context length for data loading
-        if hasattr(model, "config"):
-            context_length = model.config.context_length
-        else:
-            context_length = model.cfg["context_length"]
+        context_length = model.config.context_length
         batch_size = train_cfg["batch_size"]
 
     else:
@@ -368,66 +348,53 @@ Examples:
         if args.data is None and args.data_dir is None:
             parser.error("--data or --data-dir is required for a new training run")
 
-        # Determine architecture
-        use_new_arch = args.preset is not None or args.config is not None
-
-        if use_new_arch:
-            # New expressive architecture
-            if args.config:
-                model_config = ModelConfig.load(args.config)
-                write_status(f"CONFIG loaded from {args.config}")
+        # Handle legacy --model-size mapping
+        preset_name = args.preset
+        if not preset_name and not args.config and args.model_size:
+            msize = args.model_size.lower()
+            if msize in ("124m", "355m", "774m", "1558m"):
+                preset_name = f"gpt2-{msize}"
+                write_status(f"MAPPED legacy --model-size {args.model_size} to preset {preset_name}")
             else:
-                model_config = get_preset(args.preset)
+                parser.error(f"Unknown legacy model-size: {args.model_size}")
 
-            # Override context length and memory optimizations if specified
-            if args.context_length:
-                model_config.context_length = args.context_length
-            model_config.use_sdpa = args.use_sdpa
-            model_config.grad_checkpointing = args.checkpointing
+        if not preset_name and not args.config:
+            parser.error("Specify --preset or --config")
 
-            model = create_model_from_config(model_config, device)
-            context_length = model_config.context_length
-
-            # Save config
-            train_cfg = {
-                "data": args.data,
-                "data_dir": args.data_dir,
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "save_every": args.save_every,
-                "save_iters": args.save_iters,
-                "log_freq": args.log_freq,
-                "eval_freq": args.eval_freq,
-                "eval_iter": args.eval_iter,
-                "optimizer": args.optimizer,
-            }
-            full_cfg = {
-                "architecture": model_config.to_dict(),
-                "training": train_cfg,
-            }
+        # Load architecture configuration
+        if args.config:
+            model_config = ModelConfig.load(args.config)
+            write_status(f"CONFIG loaded from {args.config}")
         else:
-            # Legacy GPT-2 mode
-            model_size = args.model_size or "124M"
-            context_length = args.context_length or 256
-            model, model_cfg_dict = create_legacy_model(
-                model_size, context_length, args.drop_rate, device)
+            model_config = get_preset(preset_name)
 
-            train_cfg = {
-                "data": args.data,
-                "data_dir": args.data_dir,
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "save_every": args.save_every,
-                "save_iters": args.save_iters,
-                "log_freq": args.log_freq,
-                "eval_freq": args.eval_freq,
-                "eval_iter": args.eval_iter,
-                "optimizer": args.optimizer,
-            }
-            full_cfg = {"model": model_cfg_dict, "training": train_cfg}
-            write_status(f"LEGACY GPT-2 mode: {model_size}")
+        # Override context length and memory optimizations if specified
+        if args.context_length:
+            model_config.context_length = args.context_length
+        model_config.use_sdpa = args.use_sdpa
+        model_config.grad_checkpointing = args.checkpointing
+
+        model = create_model_from_config(model_config, device)
+        context_length = model_config.context_length
+
+        # Save config
+        train_cfg = {
+            "data": args.data,
+            "data_dir": args.data_dir,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "save_every": args.save_every,
+            "save_iters": args.save_iters,
+            "log_freq": args.log_freq,
+            "eval_freq": args.eval_freq,
+            "eval_iter": args.eval_iter,
+            "optimizer": args.optimizer,
+        }
+        full_cfg = {
+            "architecture": model_config.to_dict(),
+            "training": train_cfg,
+        }
 
         save_model_config(args.model_name, full_cfg)
         write_status(f"CONFIG saved to models/{args.model_name}/config.json")

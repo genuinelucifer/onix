@@ -20,12 +20,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+from architecture import ModelConfig, CausalLM, PRESETS, get_preset
+from architecture.generate import generate
+
 from model import (
-    GPT2, EOT_TOKEN_ID, build_config, download_and_load_pretrained,
-    generate, get_tokenizer, load_weights_into_gpt, text_to_token_ids,
+    EOT_TOKEN_ID, get_tokenizer, text_to_token_ids,
     token_ids_to_text, write_status, set_status_file, get_status_file,
     save_model_config, load_model_config, save_checkpoint, load_checkpoint,
-    MODEL_CONFIGS,
 )
 
 
@@ -148,7 +149,7 @@ def train_sft(model, train_loader, val_loader, optimizer, device,
 
         # Generate a sample after each epoch
         model.eval()
-        ctx_size = model.cfg["context_length"]
+        ctx_size = model.config.context_length
         enc = text_to_token_ids(start_context, tokenizer).to(device)
         with torch.no_grad():
             gen = generate(model, enc, 50, ctx_size, eos_id=EOT_TOKEN_ID)
@@ -201,8 +202,9 @@ Examples:
                         help="Path to instruction JSON (required for new run)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from latest checkpoint")
-    parser.add_argument("--model-size", default="355M",
-                        choices=list(MODEL_CONFIGS.keys()))
+    parser.add_argument("--preset", default="gpt2-124m",
+                        choices=list(PRESETS.keys()),
+                        help="Architecture preset to use for fresh SFT")
     parser.add_argument("--epochs", type=int, default=2,
                         help="Total epochs (not additional)")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -230,13 +232,13 @@ Examples:
         # ---- Resume mode ----
         write_status("RESUME loading config and checkpoint...")
         full_cfg = load_model_config(args.model_name)
-        model_cfg = full_cfg["model"]
+        model_cfg = ModelConfig.from_dict(full_cfg["architecture"])
         train_cfg = full_cfg["training"]
 
         total_epochs = args.epochs if args.epochs != 2 else train_cfg["epochs"]
         data_path = train_cfg["data"]
 
-        model = GPT2(model_cfg).to(device)
+        model = CausalLM(model_cfg).to(device)
         optimizer = torch.optim.AdamW(model.parameters(),
                                       lr=train_cfg["lr"],
                                       weight_decay=0.1)
@@ -265,10 +267,10 @@ Examples:
         if args.data is None:
             parser.error("--data is required for a new training run")
 
-        model_cfg = build_config(args.model_size)
+        model_config = get_preset(args.preset)
         train_cfg = {
             "data": args.data,
-            "base_model_size": args.model_size,
+            "preset": args.preset,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,
@@ -279,16 +281,11 @@ Examples:
         total_epochs = args.epochs
         data_path = args.data
 
-        full_cfg = {"model": model_cfg, "training": train_cfg}
+        full_cfg = {"architecture": model_config.to_dict(), "training": train_cfg}
         save_model_config(args.model_name, full_cfg)
         write_status(f"CONFIG saved to models/{args.model_name}/config.json")
 
-        # Download / load pretrained OpenAI weights
-        write_status(f"WEIGHTS downloading/loading pretrained {args.model_size}...")
-        settings, params = download_and_load_pretrained(args.model_size)
-        model = GPT2(model_cfg)
-        load_weights_into_gpt(model, params)
-        model.to(device)
+        model = CausalLM(model_config).to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                       weight_decay=0.1)
