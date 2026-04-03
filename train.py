@@ -130,8 +130,9 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
             # Iteration checkpoint
             if save_every_n_iters is not None and save_every_n_iters > 0 and global_step > 0:
                 if global_step % save_every_n_iters == 0:
+                    # Save current epoch (not epoch + 1) because the epoch is not yet complete
                     ckpt_path = save_checkpoint(
-                        model_name, model, optimizer, epoch + 1, global_step,
+                        model_name, model, optimizer, epoch, global_step,
                         tokens_seen, train_losses, val_losses, tag=f"step{global_step}")
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
 
@@ -336,7 +337,7 @@ Examples:
                          f"Increase --epochs to continue.")
             return
 
-        write_status(f"RESUMED from epoch={start_epoch} step={start_step} "
+        write_status(f"RESUMED from epoch={start_epoch + 1} step={start_step} "
                      f"tokens={start_tokens} -> training to epoch {total_epochs}")
 
         # Get context length for data loading
