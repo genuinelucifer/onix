@@ -60,6 +60,13 @@ DATASETS = {
         "type": "vision"
     },
 
+    "diffusiondb-pixelart": {
+        "path": "jainr3/diffusiondb-pixelart",
+        "name": "2k_all",
+        "description": "2k pixel-art images from DiffusionDB with text prompts.",
+        "type": "vision"
+    },
+
     # --- Other ---
     "wikitext-103": {
         "path": "wikitext",
@@ -94,22 +101,27 @@ def download(name, out_dir=None):
     print(f"Downloading {name} ({path})...")
     print(f"Description: {info['description']}")
     
-    # Load and save to disk
     # We load as a DatasetDict (all splits)
-    ds = load_dataset(path, name=config_name)
-    
-    print(f"Saving to {out_dir}...")
-    # Save as JSONL for SFT or arrow/parquet for others
-    # For SFT we often prefer JSON for easy inspection
-    if info["type"] == "sft":
-        for split, data in ds.items():
-            split_file = out_dir / f"{split}.json"
-            data.to_json(split_file, indent=2)
-            print(f"  Saved {split} split to {split_file.name}")
-    else:
-        # Standard save_to_disk for vision/others
-        ds.save_to_disk(str(out_dir))
-        print(f"  Saved to disk format in {out_dir}")
+    try:
+        ds = load_dataset(path, name=config_name, trust_remote_code=True)
+        print(f"Saving to {out_dir}...")
+        # Save as JSONL for SFT or arrow/parquet for others
+        if info["type"] == "sft":
+            for split, data in ds.items():
+                split_file = out_dir / f"{split}.json"
+                data.to_json(split_file, indent=2)
+                print(f"  Saved {split} split to {split_file.name}")
+        else:
+            ds.save_to_disk(str(out_dir))
+            print(f"  Saved to disk format in {out_dir}")
+    except RuntimeError as e:
+        if "Dataset scripts are no longer supported" in str(e):
+            print("Dataset script not supported. Falling back to snapshot_download...")
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=path, repo_type="dataset", local_dir=str(out_dir))
+            print(f"  Downloaded raw repository to {out_dir}")
+        else:
+            raise e
 
     print("\nDownload complete.")
 
