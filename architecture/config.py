@@ -181,6 +181,240 @@ class ModelConfig:
 
 
 # ===========================================================================
+#  VQ-VAE Configuration
+# ===========================================================================
+
+@dataclass
+class VQVAEConfig:
+    """
+    Complete VQ-VAE architecture specification for image tokenization.
+
+    Describes a convolutional encoder-decoder with a discrete codebook.
+    The encoder downsamples an image into a spatial grid of latent vectors,
+    which are quantized to the nearest codebook entry. The decoder
+    reconstructs the image from quantized vectors.
+    """
+
+    # --- Identity ---
+    name: str = "vqvae-default"
+
+    # --- Image ---
+    image_size: int = 256           # Input image resolution (must be square)
+    image_channels: int = 3         # RGB=3, RGBA=4
+
+    # --- Encoder / Decoder architecture ---
+    base_channels: int = 128        # First conv layer output channels
+    channel_multipliers: tuple = (1, 2, 4, 8)   # Channel scaling per downsampling stage
+    num_res_blocks: int = 2         # Residual blocks per stage
+
+    # --- Codebook ---
+    codebook_size: int = 8192       # Number of discrete visual "words"
+    codebook_dim: int = 256         # Dimension of each codebook vector
+    commitment_weight: float = 0.25 # Weight for commitment loss
+    ema_decay: float = 0.99         # EMA decay for codebook updates (0 = no EMA, use gradient)
+
+    # --- Loss ---
+    loss_type: str = "mse"          # "mse" | "perceptual" (future extension)
+
+    # --- Memory ---
+    grad_checkpointing: bool = False
+
+    def __post_init__(self):
+        # Convert list to tuple if loaded from JSON
+        if isinstance(self.channel_multipliers, list):
+            self.channel_multipliers = tuple(self.channel_multipliers)
+        self._validate()
+
+    def _validate(self):
+        # Check image_size is divisible by the total downsampling factor
+        n_downsamples = len(self.channel_multipliers) - 1
+        downsample_factor = 2 ** n_downsamples
+        assert self.image_size % downsample_factor == 0, (
+            f"image_size ({self.image_size}) must be divisible by "
+            f"downsample factor ({downsample_factor} = 2^{n_downsamples})"
+        )
+        assert self.loss_type in ("mse", "perceptual"), \
+            f"Unknown loss_type: {self.loss_type}"
+
+    @property
+    def latent_grid_size(self) -> int:
+        """Spatial resolution of the latent grid after encoding."""
+        n_downsamples = len(self.channel_multipliers) - 1
+        return self.image_size // (2 ** n_downsamples)
+
+    @property
+    def num_visual_tokens(self) -> int:
+        """Total number of tokens per image (latent_grid_size^2)."""
+        return self.latent_grid_size ** 2
+
+    # --- Serialization ---
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        # tuple → list for JSON serialization
+        d["channel_multipliers"] = list(d["channel_multipliers"])
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "VQVAEConfig":
+        known = {k for k in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    def save(self, path: str | Path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "VQVAEConfig":
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    def summary(self) -> str:
+        gs = self.latent_grid_size
+        lines = [
+            f"VQ-VAE: {self.name}",
+            f"  Image: {self.image_size}x{self.image_size}x{self.image_channels}",
+            f"  Latent grid: {gs}x{gs} = {self.num_visual_tokens} tokens",
+            f"  Codebook: {self.codebook_size} entries, dim={self.codebook_dim}",
+            f"  Channels: base={self.base_channels}, mults={self.channel_multipliers}",
+            f"  Res blocks per stage: {self.num_res_blocks}",
+            f"  Loss: {self.loss_type}, commitment_weight={self.commitment_weight}",
+            f"  EMA decay: {self.ema_decay}",
+        ]
+        return "\n".join(lines)
+
+
+# ===========================================================================
+#  Multi-Modal Configuration (Transformer + frozen VQ-VAE)
+# ===========================================================================
+
+@dataclass
+class MultiModalConfig:
+    """
+    Wraps a transformer ModelConfig with VQ-VAE reference for
+    text-to-image autoregressive training (Phase 2).
+
+    The transformer operates on a joint token space:
+      [0, text_vocab_size)              → text BPE tokens
+      [text_vocab_size, text+visual)    → visual codebook tokens
+      text+visual, text+visual+1        → <IMG_START>
+      text+visual+1, text+visual+2      → <IMG_END>
+    """
+
+    # --- Sub-configs ---
+    transformer: Optional[ModelConfig] = None
+    vqvae: Optional[VQVAEConfig] = None
+
+    # --- References ---
+    vqvae_checkpoint: str = ""      # Path to frozen VQ-VAE checkpoint
+
+    # --- Token space ---
+    text_vocab_size: int = 50257    # BPE vocab size
+    max_text_tokens: int = 256      # Max text prompt length (padded/truncated)
+
+    # --- Loss ---
+    loss_mask_text: bool = True     # Only compute loss on visual token positions
+
+    def __post_init__(self):
+        if self.transformer is None:
+            self.transformer = ModelConfig()
+        if self.vqvae is None:
+            self.vqvae = VQVAEConfig()
+
+    @property
+    def visual_vocab_size(self) -> int:
+        return self.vqvae.codebook_size
+
+    @property
+    def num_visual_tokens(self) -> int:
+        return self.vqvae.num_visual_tokens
+
+    @property
+    def img_start_id(self) -> int:
+        return self.text_vocab_size + self.visual_vocab_size
+
+    @property
+    def img_end_id(self) -> int:
+        return self.text_vocab_size + self.visual_vocab_size + 1
+
+    @property
+    def total_vocab_size(self) -> int:
+        """text + visual + <IMG_START> + <IMG_END>"""
+        return self.text_vocab_size + self.visual_vocab_size + 2
+
+    @property
+    def max_seq_length(self) -> int:
+        """Max sequence: text_tokens + <IMG_START> + visual_tokens + <IMG_END>"""
+        return self.max_text_tokens + 1 + self.num_visual_tokens + 1
+
+    def to_dict(self) -> dict:
+        return {
+            "transformer": self.transformer.to_dict(),
+            "vqvae": self.vqvae.to_dict(),
+            "vqvae_checkpoint": self.vqvae_checkpoint,
+            "text_vocab_size": self.text_vocab_size,
+            "max_text_tokens": self.max_text_tokens,
+            "loss_mask_text": self.loss_mask_text,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MultiModalConfig":
+        transformer = ModelConfig.from_dict(d["transformer"])
+        vqvae = VQVAEConfig.from_dict(d["vqvae"])
+        return cls(
+            transformer=transformer,
+            vqvae=vqvae,
+            vqvae_checkpoint=d.get("vqvae_checkpoint", ""),
+            text_vocab_size=d.get("text_vocab_size", 50257),
+            max_text_tokens=d.get("max_text_tokens", 256),
+            loss_mask_text=d.get("loss_mask_text", True),
+        )
+
+    def save(self, path: str | Path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "MultiModalConfig":
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    def build_transformer_config(self) -> ModelConfig:
+        """
+        Return a ModelConfig with vocab_size and context_length
+        automatically set for the multi-modal token space.
+        """
+        cfg = ModelConfig.from_dict(self.transformer.to_dict())
+        cfg.vocab_size = self.total_vocab_size
+        cfg.context_length = self.max_seq_length
+        return cfg
+
+    def summary(self) -> str:
+        t_cfg = self.build_transformer_config()
+        lines = [
+            f"Multi-Modal Config:",
+            f"  Text vocab: {self.text_vocab_size}, Visual vocab: {self.visual_vocab_size}",
+            f"  Total vocab: {self.total_vocab_size}",
+            f"  Max seq length: {self.max_seq_length} "
+            f"(text={self.max_text_tokens} + img_start + visual={self.num_visual_tokens} + img_end)",
+            f"  Special tokens: <IMG_START>={self.img_start_id}, <IMG_END>={self.img_end_id}",
+            f"  Loss mask text: {self.loss_mask_text}",
+            f"  VQ-VAE checkpoint: {self.vqvae_checkpoint}",
+            f"",
+            f"--- Transformer ---",
+            t_cfg.summary(),
+            f"",
+            f"--- VQ-VAE ---",
+            self.vqvae.summary(),
+        ]
+        return "\n".join(lines)
+
+
+# ===========================================================================
 #  Presets — ready-to-use configs for popular architectures
 # ===========================================================================
 

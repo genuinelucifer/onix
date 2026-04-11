@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run YALLM pretraining in the background.
+# Run YALLM training in the background.
 #
-# Preset:     ./run_train.sh my-llama --preset llama-1b
-# Config:     ./run_train.sh my-model --config configs/custom.json
-# Legacy:     ./run_train.sh my-gpt --model-size 124M
-# Resume:     ./run_train.sh my-gpt --resume
-# Shards:     ./run_train.sh my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
+# LLM:        ./run_train.sh my-llama --preset llama-1b
+# LLM Config: ./run_train.sh my-model --config configs/custom.json
+# VQ-VAE:     ./run_train.sh my-vqvae --mode vqvae --config configs/vqvae_default.json --data-dir /path/to/images/
+# MultiModal: ./run_train.sh my-imggen --mode multimodal --config configs/multimodal_pixelart.json --data-dir /path/to/pairs/
+# Resume:     ./run_train.sh my-model --resume
 # Override:   EPOCHS=50 DATA=myfile.txt ./run_train.sh my-gpt --preset llama-1b
 #
 # Monitor:    tail -f $MODELS_DIR/<model_name>/status.txt
@@ -21,7 +21,7 @@ source ~/repos/pytorch_env/bin/activate
 # Force experimental Flash/Mem-Eff Attention on AMD Consumer GPUs
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 
-MODEL_NAME="${1:?Usage: $0 <model_name> [--preset <preset> | --config <file> | --model-size <size>] [extra args]}"
+MODEL_NAME="${1:?Usage: $0 <model_name> [--mode <llm|vqvae|multimodal>] [--preset <preset> | --config <file>] [extra args]}"
 shift
 
 # Default args (override via env vars)
@@ -36,16 +36,19 @@ MODELS_DIR="${YALLM_MODELS_DIR:-$SCRIPT_DIR/models}"
 # Build args list
 ARGS=(--model-name "$MODEL_NAME")
 
-# Only add defaults if not resuming
+# Only add defaults if not resuming and not in vqvae/multimodal mode
 if [[ " $* " != *" --resume "* ]]; then
-    # Add data source (unless --data or --data-dir already specified)
-    if [[ " $* " != *" --data "* ]] && [[ " $* " != *" --data-dir "* ]]; then
-        ARGS+=(--data "$DATA")
+    # Check if mode is vqvae or multimodal (they use --data-dir, not --data)
+    if [[ " $* " != *" --mode vqvae "* ]] && [[ " $* " != *" --mode multimodal "* ]]; then
+        # LLM mode: add data source unless already specified
+        if [[ " $* " != *" --data "* ]] && [[ " $* " != *" --data-dir "* ]]; then
+            ARGS+=(--data "$DATA")
+        fi
     fi
 fi
 ARGS+=(--epochs "$EPOCHS" --save-every "$SAVE_EVERY" --eval-freq "$EVAL_FREQ" --log-freq "$LOG_FREQ")
 
-echo "Starting pretraining in background..."
+echo "Starting training in background..."
 echo "  model_name=$MODEL_NAME"
 echo "  args: ${ARGS[*]} $*"
 echo "  Monitor: tail -f $MODELS_DIR/$MODEL_NAME/status.txt"
@@ -58,3 +61,4 @@ nohup python -u train.py "${ARGS[@]}" "$@" \
 echo $! > "$MODELS_DIR/$MODEL_NAME/.pid"
 echo "PID: $(cat "$MODELS_DIR/$MODEL_NAME/.pid")"
 echo "To stop: kill \$(cat $MODELS_DIR/$MODEL_NAME/.pid)"
+

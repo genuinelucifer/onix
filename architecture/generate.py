@@ -127,3 +127,131 @@ def generate_from_config(
         repetition_penalty=gen_config.repetition_penalty,
         eos_id=gen_config.eos_id,
     )
+
+
+# ===========================================================================
+#  Image generation (multi-modal inference)
+# ===========================================================================
+
+def generate_image(
+    model,
+    vqvae,
+    text_prompt: str,
+    tokenizer,
+    mm_config,
+    temperature: float = 0.9,
+    top_k: int = 100,
+    top_p: float = None,
+) -> tuple:
+    """
+    Generate an image from a text prompt using a trained multi-modal LLM
+    and a frozen VQ-VAE decoder.
+
+    Pipeline:
+      1. Tokenize text prompt via BPE
+      2. Append <IMG_START> token
+      3. Autoregressively generate visual tokens
+      4. Reshape visual tokens to 2D grid
+      5. Decode via frozen VQ-VAE to pixel space
+
+    Args:
+        model: Trained CausalLM (multi-modal, joint vocab)
+        vqvae: Frozen VQVAE model (for decoding tokens → pixels)
+        text_prompt: Text description of the desired image
+        tokenizer: BPE tokenizer (tiktoken)
+        mm_config: MultiModalConfig with token space info
+        temperature: Sampling temperature
+        top_k: Top-k filtering
+        top_p: Nucleus sampling threshold
+
+    Returns:
+        (image_tensor, visual_tokens)
+        image_tensor: (1, C, H, W) reconstructed image in [-1, 1]
+        visual_tokens: (1, num_visual_tokens) generated token indices
+    """
+    device = next(model.parameters()).device
+
+    # Step 1: Tokenize text
+    text_tokens = tokenizer.encode(text_prompt)
+    # Truncate if needed
+    if len(text_tokens) > mm_config.max_text_tokens:
+        text_tokens = text_tokens[:mm_config.max_text_tokens]
+
+    # Step 2: Prepare initial sequence: text_tokens + <IMG_START>
+    sequence = text_tokens + [mm_config.img_start_id]
+    idx = torch.tensor([sequence], dtype=torch.long, device=device)
+
+    # Step 3: Autoregressively generate visual tokens
+    num_visual = mm_config.num_visual_tokens
+    context_size = mm_config.max_seq_length
+
+    model.eval()
+    visual_token_ids = []
+    with torch.no_grad():
+        for _ in range(num_visual):
+            # Crop to context window
+            idx_cond = idx[:, -context_size:]
+            logits = model(idx_cond)[:, -1, :]  # (1, vocab_size)
+
+            # Restrict sampling to visual token range only
+            # Zero out logits for non-visual tokens
+            mask = torch.ones_like(logits) * float("-inf")
+            visual_start = mm_config.text_vocab_size
+            visual_end = visual_start + mm_config.visual_vocab_size
+            mask[:, visual_start:visual_end] = 0
+            logits = logits + mask
+
+            # Top-k filtering
+            if top_k is not None:
+                top_logits, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                min_val = top_logits[:, -1].unsqueeze(-1)
+                logits = torch.where(
+                    logits < min_val,
+                    torch.full_like(logits, float("-inf")),
+                    logits,
+                )
+
+            # Top-p filtering
+            if top_p is not None and top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(
+                    F.softmax(sorted_logits, dim=-1), dim=-1
+                )
+                sorted_mask = (
+                    cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                )
+                sorted_logits[sorted_mask] = float("-inf")
+                logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+
+            # Sample
+            if temperature > 0:
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+
+            # Check for <IMG_END>
+            if idx_next.item() == mm_config.img_end_id:
+                break
+
+            visual_token_ids.append(idx_next.item())
+            idx = torch.cat((idx, idx_next), dim=1)
+
+    # Step 4: Convert visual tokens to codebook indices
+    # Visual tokens in the joint vocab are offset by text_vocab_size
+    codebook_indices = [t - mm_config.text_vocab_size for t in visual_token_ids]
+
+    # Pad or truncate to exact num_visual_tokens
+    if len(codebook_indices) < num_visual:
+        codebook_indices.extend([0] * (num_visual - len(codebook_indices)))
+    codebook_indices = codebook_indices[:num_visual]
+
+    indices_tensor = torch.tensor(
+        [codebook_indices], dtype=torch.long, device=device
+    )
+
+    # Step 5: Decode via VQ-VAE
+    image = vqvae.decode(indices_tensor)
+
+    return image, indices_tensor
