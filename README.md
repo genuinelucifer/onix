@@ -18,7 +18,7 @@ The framework uses a unified `.sh` tracking structure. Depending on the modality
 **A. Standard Text LLMs**
 Run standard transformer training optimized for memory via 8-bit `adamw` bitsandbytes implementations.
 ```bash
-./run_train.sh my-gpt --model-size 124M --data ../the-verdict.txt
+./run_train.sh my-gpt --mode llm --model-size 124M --data ../the-verdict.txt
 ```
 
 **B. Vision Models (VQ-VAE)**

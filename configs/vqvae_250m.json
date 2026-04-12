@@ -1,0 +1,14 @@
+{
+    "name": "vqvae-250m",
+    "image_size": 256,
+    "image_channels": 3,
+    "base_channels": 224,
+    "channel_multipliers": [1, 2, 4, 4],
+    "num_res_blocks": 3,
+    "codebook_size": 8192,
+    "codebook_dim": 256,
+    "commitment_weight": 0.25,
+    "ema_decay": 0.99,
+    "loss_type": "mse",
+    "grad_checkpointing": false
+}

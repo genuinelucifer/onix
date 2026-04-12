@@ -11,13 +11,13 @@ Supports:
 
 Examples:
   # Train with a preset
-  ./run_train.sh my-llama --preset llama-1b --data ../the-verdict.txt
+  ./run_train.sh my-llama --mode llm --preset llama-1b --data ../the-verdict.txt
 
   # Train with custom config
-  ./run_train.sh my-model --config configs/custom.json --data ../the-verdict.txt
+  ./run_train.sh my-model --mode llm --config configs/custom.json --data ../the-verdict.txt
 
   # Train on pre-tokenized shards
-  ./run_train.sh my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
+  ./run_train.sh my-llama --mode llm --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
 
   # Resume training
   ./run_train.sh my-llama --resume
@@ -215,14 +215,14 @@ def main():
         epilog="""
 Examples:
   # New architecture presets
-  python train.py --model-name my-llama --preset llama-1b --data ../the-verdict.txt
-  python train.py --model-name my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
+  python train.py --mode llm --model-name my-llama --preset llama-1b --data ../the-verdict.txt
+  python train.py --mode llm --model-name my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
 
   # Custom config file
-  python train.py --model-name my-custom --config my_config.json --data ../the-verdict.txt
+  python train.py --mode llm --model-name my-custom --config my_config.json --data ../the-verdict.txt
 
   # Legacy GPT-2 mode
-  python train.py --model-name verdict-gpt --data ../the-verdict.txt --model-size 124M
+  python train.py --mode llm --model-name verdict-gpt --data ../the-verdict.txt --model-size 124M
 
   # Resume any model
   python train.py --model-name my-llama --resume

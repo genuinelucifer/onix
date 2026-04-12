@@ -14,10 +14,11 @@ Text-based models can be initialized using pre-optimized presets or custom `conf
 
 ```bash
 # Using a 1B LLaMA preset
-./run_train.sh my-llama --preset llama-1b --data-dir pretrain_data/tiny_stories/
+./run_train.sh my-llama --mode llm --preset llama-1b --data-dir pretrain_data/tiny_stories/
 
 # Using a low-memory 8-bit config structure for heavy iterations
 ./run_train.sh llama-1b-fast \
+    --mode llm \
     --preset llama-1b \
     --data-dir pretrain_data/tiny_stories/ \
     --optimizer adamw8bit \

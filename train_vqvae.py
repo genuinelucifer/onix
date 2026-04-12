@@ -117,8 +117,10 @@ def evaluate_vqvae(model, val_loader, device, vqvae_config, num_batches=None):
             recon_loss = nn.functional.mse_loss(recon, images).item()
             total_recon += recon_loss
             total_vq += vq_loss.item()
-            # Compute codebook usage
-            unique = indices.unique().numel()
+            # Compute codebook usage.
+            # HIP/ROCm bug: calling torch.unique() dynamically on GPU tensors throws
+            # 'c10::AcceleratorError: unspecified launch failure'. Force fallback to CPU.
+            unique = indices.cpu().unique().numel()
             total_usage += unique / vqvae_config.codebook_size
             n += 1
 
@@ -166,8 +168,8 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
             global_step += 1
 
             if global_step % log_freq == 0:
-                # Compute codebook usage
-                usage = indices.unique().numel() / vqvae_config.codebook_size
+                # Compute codebook usage. (Bypass ROCm GPU unique() crash via .cpu() fallback)
+                usage = indices.cpu().unique().numel() / vqvae_config.codebook_size
                 write_status(
                     f"PROGRESS epoch={epoch+1}/{num_epochs} step={global_step:06d} "
                     f"loss={total_loss.item():.4f} recon={loss_dict['recon_loss']:.4f} "
@@ -182,7 +184,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                 val_losses.append(recon_l + vq_l)
                 write_status(
                     f"EVAL epoch={epoch+1}/{num_epochs} step={global_step:06d} "
-                    f"val_recon={recon_l:.4f} val_vq={vq_l:.4f} "
+                    f"val_loss={recon_l + vq_l:.4f} val_recon={recon_l:.4f} val_vq={vq_l:.4f} "
                     f"codebook_usage={usage:.2%}"
                 )
 

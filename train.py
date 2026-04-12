@@ -7,11 +7,9 @@ Routes training to the appropriate script based on mode:
   --mode vqvae        → train_vqvae.py  (VQ-VAE image tokenizer, Phase 1)
   --mode multimodal   → train_multimodal.py (text-to-image LLM, Phase 2)
 
-For backward compatibility, if no --mode is specified, defaults to 'llm'.
-
 Usage:
-    # LLM (default, same as before)
-    python train.py --model-name my-llama --preset llama-1b --data ../the-verdict.txt
+    # LLM
+    python train.py --mode llm --model-name my-llama --preset llama-1b --data ../the-verdict.txt
 
     # VQ-VAE
     python train.py --mode vqvae --model-name my-vqvae --config configs/vqvae_default.json \\
@@ -22,7 +20,7 @@ Usage:
         --config configs/multimodal_pixelart.json \\
         --data-dir /path/to/image_text_pairs/ --epochs 50
 
-    # Resume (auto-detects mode from saved config)
+    # Resume (auto-detects mode from saved config, --mode not strictly required)
     python train.py --model-name my-vqvae --resume
 """
 
@@ -76,7 +74,8 @@ def main():
             mode = detect_model_type(pre_args.model_name)
             print(f"Auto-detected model type: {mode}")
         else:
-            mode = "llm"  # default for backward compatibility
+            print("Error: --mode (llm, vqvae, multimodal) is mandatory for new training runs.", file=sys.stderr)
+            sys.exit(1)
 
     # Build the full arg list for the sub-script
     # Re-add --model-name and --resume if they were parsed
