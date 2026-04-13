@@ -25,6 +25,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+import torch
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image as PILImage
+
 import gradio as gr
 from model_runner.runner import (
     load_model,
@@ -103,6 +108,18 @@ CUSTOM_CSS = """
     min-height: 500px;
     font-size: 16px !important;
 }
+
+/* Hide progressive loading element for specific containers */
+.hide-progress [class*="progress"],
+.hide-progress [class*="generating"],
+.hide-progress [class*="loading"],
+.hide-progress [class*="loader"],
+.hide-progress [class*="pending"] {
+    display: none !important;
+    opacity: 0 !important;
+    height: 0 !important;
+    overflow: hidden !important;
+}
 """
 
 _theme = gr.themes.Soft(
@@ -125,28 +142,90 @@ _theme = gr.themes.Soft(
     body_text_color="#334155",
 )
 
+JS_SHOW_OVERLAY = """
+function() {
+    let overlay = document.getElementById('custom-loader-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'custom-loader-overlay';
+        overlay.style.position = 'fixed';
+        overlay.style.top = '0';
+        overlay.style.left = '0';
+        overlay.style.width = '100vw';
+        overlay.style.height = '100vh';
+        overlay.style.backgroundColor = 'rgba(255, 255, 255, 0.7)';
+        overlay.style.zIndex = '9999';
+        overlay.style.display = 'flex';
+        overlay.style.justifyContent = 'center';
+        overlay.style.alignItems = 'center';
+        overlay.style.fontSize = '2rem';
+        overlay.style.fontWeight = 'bold';
+        overlay.style.color = '#333';
+        overlay.style.backdropFilter = 'blur(4px)';
+        overlay.innerHTML = 'Loading Model to GPU... Please wait.';
+        document.body.appendChild(overlay);
+    }
+    overlay.style.display = 'flex';
+}
+"""
+
+JS_HIDE_OVERLAY = """
+function() {
+    let overlay = document.getElementById('custom-loader-overlay');
+    if (overlay) {
+        overlay.style.display = 'none';
+    }
+}
+"""
+
 
 
 # ---------------------------------------------------------------------------
 #  Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_handler(checkpoint_path: str, device: str):
+def pick_model_path():
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        path = filedialog.askopenfilename(title="Select Model Checkpoint")
+        root.destroy()
+        return path or ""
+    except Exception as e:
+        print(f"File dialog error: {e}")
+        return ""
+
+def pick_config_path():
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        path = filedialog.askopenfilename(title="Select Config JSON")
+        root.destroy()
+        return path or ""
+    except Exception as e:
+        print(f"File dialog error: {e}")
+        return ""
+
+def load_model_handler(checkpoint_path: str, device: str, config_path: str):
     """Handle model loading from the UI."""
     global _loaded_model, _conversation_history
 
     if not checkpoint_path or not checkpoint_path.strip():
         return (
             "<div class='status-empty'>No checkpoint path provided</div>",
+            gr.update(value="", visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
         )
 
     checkpoint_path = checkpoint_path.strip()
+    config_path = config_path.strip() if config_path else None
 
     try:
-        _loaded_model = load_model(checkpoint_path, device=device)
+        _loaded_model = load_model(checkpoint_path, device=device, config_path=config_path)
         _conversation_history = []
 
         info = get_model_info(_loaded_model)
@@ -154,10 +233,10 @@ def load_model_handler(checkpoint_path: str, device: str):
         model_type = _loaded_model.model_type
 
         status_html = f"<div class='status-loaded'>✅ Model loaded — {model_type.upper()}</div>"
-        info_md = f"<div class='model-info'>\n\n{info_text}\n\n</div>"
 
         return (
-            status_html + "\n" + info_md,
+            status_html,
+            gr.update(value=info_text, visible=True),
             gr.update(visible=(model_type == "vqvae")),
             gr.update(visible=(model_type == "multimodal")),
             gr.update(visible=(model_type == "llm")),
@@ -166,10 +245,29 @@ def load_model_handler(checkpoint_path: str, device: str):
     except Exception as e:
         return (
             f"<div class='status-empty'>❌ Failed to load: {e}</div>",
+            gr.update(value="", visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
         )
+
+def unload_model_handler():
+    """Unload model and free GPU memory."""
+    global _loaded_model, _conversation_history
+    
+    _loaded_model = None
+    _conversation_history = []
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return (
+        "<div class='status-empty'>No model loaded</div>",
+        gr.update(value="", visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +282,6 @@ def vqvae_reconstruct(image):
     if image is None:
         return None, "Please upload an image"
 
-    from PIL import Image as PILImage
     if not isinstance(image, PILImage.Image):
         image = PILImage.fromarray(image)
 
@@ -228,32 +325,52 @@ def multimodal_generate(prompt, temperature, top_k, top_p):
 #  LLM chat handlers
 # ---------------------------------------------------------------------------
 
-def llm_chat(message, chat_history, temperature, top_k, top_p,
-             max_new_tokens, repetition_penalty):
-    """Handle LLM chat message."""
+def llm_user_add(message, chat_history):
+    """Handle the user message addition: clear input and disable it."""
+    if not message or not message.strip():
+        # Return same values to avoid error
+        return gr.update(), chat_history or []
+    
+    chat_history = chat_history or []
+    chat_history.append({"role": "user", "content": message.strip()})
+    
+    return gr.update(value="", interactive=False), chat_history
+
+
+def llm_bot_gen(chat_history, temperature, top_k, top_p,
+                max_new_tokens, repetition_penalty):
+    """Actually run inference and add the bot's response bubble."""
     if _loaded_model is None or _loaded_model.model_type != "llm":
         chat_history = chat_history or []
-        chat_history.append({"role": "user", "content": message})
         chat_history.append({
-            "role": "assistant",
-            "content": "⚠️ No LLM model loaded. Please load a model first.",
+            "role": "assistant", 
+            "content": "⚠️ No LLM model loaded. Please load a model first."
         })
-        return "", chat_history
+        return chat_history, gr.update(interactive=True)
 
-    if not message or not message.strip():
-        return "", chat_history or []
+    if not chat_history:
+        return chat_history, gr.update(interactive=True)
 
-    chat_history = chat_history or []
-    chat_history.append({"role": "user", "content": message})
-
-    # Build conversation text from history
-    # Simple format: just concatenate all messages
+    # Build conversation text
     conv_text = ""
     for msg in chat_history:
-        if msg["role"] == "user":
-            conv_text += msg["content"]
-        elif msg["role"] == "assistant":
-            conv_text += msg["content"]
+        # Robust access for both dicts and ChatMessage objects
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+        else:
+            content = getattr(msg, "content", "")
+        
+        # Handle cases where content is a list (multimodal/segment format)
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and "text" in part:
+                    parts.append(part["text"])
+            content = "".join(parts)
+            
+        conv_text += str(content)
 
     params = GenerationParams(
         max_new_tokens=int(max_new_tokens),
@@ -267,12 +384,9 @@ def llm_chat(message, chat_history, temperature, top_k, top_p,
         response = run_llm_inference(_loaded_model, conv_text, params)
         chat_history.append({"role": "assistant", "content": response})
     except Exception as e:
-        chat_history.append({
-            "role": "assistant",
-            "content": f"⚠️ Generation error: {e}",
-        })
+        chat_history.append({"role": "assistant", "content": f"⚠️ Generation error: {e}"})
 
-    return "", chat_history
+    return chat_history, gr.update(interactive=True)
 
 
 def clear_chat():
@@ -307,24 +421,39 @@ def create_ui():
                 checkpoint_input = gr.Textbox(
                     label="Checkpoint path",
                     placeholder="models/my-model/checkpoint_final.pt  (or just the model directory)",
-                    scale=5,
+                    scale=10,
+                    lines=2,
                     interactive=True,
                 )
+                browse_model_btn = gr.Button("📁", scale=1, min_width=50)
+
+            with gr.Row():
+                config_input = gr.Textbox(
+                    label="Config path (Optional)",
+                    placeholder="Path to config.json if not alongside model",
+                    scale=10,
+                    lines=2,
+                    interactive=True,
+                )
+                browse_config_btn = gr.Button("📁", scale=1, min_width=50)
+                
+            with gr.Row():
                 device_dropdown = gr.Dropdown(
                     label="Device",
-                    choices=["cuda", "cpu"] + [
-                        f"cuda:{i}" for i in range(8)
-                    ],
+                    choices=["cuda", "cpu"] + [f"cuda:{i}" for i in range(8)],
                     value="cuda",
-                    scale=1,
                     interactive=True,
+                    scale=2,
                 )
-                load_btn = gr.Button(
-                    "🔄 Load", variant="primary", scale=1
-                )
+                load_btn = gr.Button("🔄 Load", variant="primary", scale=1)
+                unload_btn = gr.Button("🗑️ Unload", variant="stop", scale=1)
 
             model_status = gr.HTML(
                 value="<div class='status-empty'>No model loaded</div>",
+            )
+            model_info_html = gr.HTML(
+                visible=False,
+                elem_classes=["model-info"],
             )
 
         # ---- VQ-VAE Tab ----
@@ -352,7 +481,7 @@ def create_ui():
                         interactive=False,
                         elem_classes=["generated-image"],
                     )
-                    vqvae_stats = gr.Markdown("")
+                    vqvae_stats = gr.Markdown("", elem_classes=["hide-progress"])
 
         # ---- Multimodal Tab ----
         with gr.Group(visible=False) as multimodal_section:
@@ -391,7 +520,7 @@ def create_ui():
                         interactive=False,
                         elem_classes=["generated-image"],
                     )
-                    mm_status = gr.Markdown("")
+                    mm_status = gr.Markdown("", elem_classes=["hide-progress"])
 
         # ---- LLM Chat Tab ----
         with gr.Group(visible=False) as llm_section:
@@ -409,6 +538,7 @@ def create_ui():
                             placeholder="Type your message here...",
                             scale=5,
                             lines=1,
+                            elem_classes=["hide-progress"],
                         )
                         chat_send = gr.Button(
                             "Send", variant="primary", scale=1
@@ -440,17 +570,58 @@ def create_ui():
 
         # ---- Event bindings ----
 
+        # Browse buttons
+        browse_model_btn.click(
+            fn=pick_model_path,
+            outputs=[checkpoint_input],
+            show_progress="hidden",
+        )
+        browse_config_btn.click(
+            fn=pick_config_path,
+            outputs=[config_input],
+            show_progress="hidden",
+        )
+
         # Load model
         load_btn.click(
+            fn=lambda: None, js=JS_SHOW_OVERLAY
+        ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown],
-            outputs=[model_status, vqvae_section, multimodal_section, llm_section],
+            inputs=[checkpoint_input, device_dropdown, config_input],
+            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            show_progress="hidden",
+        ).then(
+            fn=lambda: None, js=JS_HIDE_OVERLAY
         )
+        
         # Also load on enter key in path input
         checkpoint_input.submit(
+            fn=lambda: None, js=JS_SHOW_OVERLAY
+        ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown],
-            outputs=[model_status, vqvae_section, multimodal_section, llm_section],
+            inputs=[checkpoint_input, device_dropdown, config_input],
+            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            show_progress="hidden",
+        ).then(
+            fn=lambda: None, js=JS_HIDE_OVERLAY
+        )
+        
+        config_input.submit(
+            fn=lambda: None, js=JS_SHOW_OVERLAY
+        ).then(
+            fn=load_model_handler,
+            inputs=[checkpoint_input, device_dropdown, config_input],
+            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            show_progress="hidden",
+        ).then(
+            fn=lambda: None, js=JS_HIDE_OVERLAY
+        )
+        
+        # Unload model
+        unload_btn.click(
+            fn=unload_model_handler,
+            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            show_progress="hidden",
         )
 
         # VQ-VAE
@@ -468,27 +639,40 @@ def create_ui():
         )
 
         # LLM Chat
+        chat_inputs = [
+            chat_input, chatbot,
+            llm_temp, llm_topk, llm_topp,
+            llm_max_tokens, llm_rep_penalty,
+        ]
+        
+        # User step: Add msg, clear + disable input
         chat_send.click(
-            fn=llm_chat,
-            inputs=[
-                chat_input, chatbot,
-                llm_temp, llm_topk, llm_topp,
-                llm_max_tokens, llm_rep_penalty,
-            ],
+            fn=llm_user_add,
+            inputs=[chat_input, chatbot],
             outputs=[chat_input, chatbot],
+            show_progress="minimal",
+        ).then(
+            fn=llm_bot_gen,
+            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty],
+            outputs=[chatbot, chat_input],
+            show_progress="minimal",
         )
         chat_input.submit(
-            fn=llm_chat,
-            inputs=[
-                chat_input, chatbot,
-                llm_temp, llm_topk, llm_topp,
-                llm_max_tokens, llm_rep_penalty,
-            ],
+            fn=llm_user_add,
+            inputs=[chat_input, chatbot],
             outputs=[chat_input, chatbot],
+            show_progress="minimal",
+        ).then(
+            fn=llm_bot_gen,
+            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty],
+            outputs=[chatbot, chat_input],
+            show_progress="minimal",
         )
+        
         chat_clear.click(
             fn=clear_chat,
             outputs=[chatbot, chat_input],
+            show_progress="minimal",
         )
 
     return app

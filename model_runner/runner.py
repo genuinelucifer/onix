@@ -129,6 +129,7 @@ def _resolve_checkpoint(path: str) -> Path:
 def load_model(
     checkpoint_path: str,
     device: str = "cuda",
+    config_path: Optional[str] = None,
 ) -> LoadedModel:
     """
     Load a model from a checkpoint file or model directory.
@@ -147,8 +148,12 @@ def load_model(
     dev = torch.device(device)
 
     # Load config
-    config_path = find_config_json(str(ckpt_path))
-    with open(config_path) as f:
+    if config_path and config_path.strip():
+        actual_config_path = Path(config_path.strip())
+    else:
+        actual_config_path = find_config_json(str(ckpt_path))
+        
+    with open(actual_config_path) as f:
         full_config = json.load(f)
 
     model_type = detect_model_type(full_config)
@@ -453,17 +458,20 @@ def get_model_info(loaded: LoadedModel) -> dict:
 
 
 def format_model_info(info: dict) -> str:
-    """Format model info dict as a readable string."""
+    """Format model info dict as an HTML snippet with 3 columns."""
     lines = []
     type_labels = {
         "vqvae": "🖼️ VQ-VAE (Image Reconstruction)",
         "multimodal": "🎨 Multimodal (Text → Image)",
         "llm": "💬 LLM (Text Generation)",
     }
-    lines.append(f"**Type:** {type_labels.get(info['model_type'], info['model_type'])}")
-    lines.append(f"**Parameters:** {info['params']}")
-    lines.append(f"**Device:** {info['device']}")
-    lines.append(f"**Checkpoint:** `{Path(info['checkpoint']).name}`")
+    
+    html = ["<div style='display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;'>"]
+    
+    html.append(f"<div><strong>Type:</strong><br/>{type_labels.get(info['model_type'], info['model_type'])}</div>")
+    html.append(f"<div><strong>Parameters:</strong><br/>{info['params']}</div>")
+    html.append(f"<div><strong>Device:</strong><br/>{info['device']}</div>")
+    html.append(f"<div><strong>Checkpoint:</strong><br/><code>{Path(info['checkpoint']).name}</code></div>")
 
     # Type-specific info
     skip_keys = {"model_type", "params", "device", "checkpoint"}
@@ -471,6 +479,7 @@ def format_model_info(info: dict) -> str:
         if k in skip_keys:
             continue
         label = k.replace("_", " ").title()
-        lines.append(f"**{label}:** {v}")
+        html.append(f"<div><strong>{label}:</strong><br/>{v}</div>")
 
-    return "\n".join(lines)
+    html.append("</div>")
+    return "\n".join(html)
