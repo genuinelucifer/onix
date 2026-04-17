@@ -47,6 +47,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import tarfile
+import zipfile
 
 from PIL import Image
 
@@ -236,15 +238,20 @@ def process_image_dir(
 ):
     """Process a plain directory of image files."""
 
-    # Pre-extract any zip files found in the directory
+    # Pre-extract any zip or tar.gz files found in the directory
     zip_paths = list(input_dir.rglob("*.zip"))
     if zip_paths:
-        import zipfile
         print(f"Found {len(zip_paths)} zip files, extracting...")
         for zp in zip_paths:
             with zipfile.ZipFile(zp, 'r') as zip_ref:
-                # Extract in the same directory as the zip file
                 zip_ref.extractall(zp.parent)
+
+    tar_paths = list(input_dir.rglob("*.tar.gz"))
+    if tar_paths:
+        print(f"Found {len(tar_paths)} tar.gz files, extracting...")
+        for tp in tar_paths:
+            with tarfile.open(tp, 'r:gz') as tar_ref:
+                tar_ref.extractall(tp.parent)
 
     if recursive:
         image_paths = sorted([
@@ -261,19 +268,40 @@ def process_image_dir(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-load metadata if metadata.parquet exists
+    # Pre-load metadata (check root and annotations/ folder)
     metadata_df = None
-    meta_path = input_dir / "metadata.parquet"
-    if meta_path.exists():
-        try:
-            import pandas as pd
-            metadata_df = pd.read_parquet(meta_path)
-            # Ensure index is image_name for quick lookup if available
-            if "image_name" in metadata_df.columns:
-                metadata_df = metadata_df.set_index("image_name")
-            print(f"Loaded metadata.parquet with {len(metadata_df)} entries.")
-        except ImportError:
-            print("Warning: pandas or pyarrow not installed, skipping metadata.parquet")
+    meta_paths = [
+        input_dir / "metadata.parquet",
+        input_dir / "annotations" / "gz_decals_auto_posteriors.parquet"
+    ]
+    # Also look for any parquet in annotations/
+    if (input_dir / "annotations").exists():
+        meta_paths.extend(list((input_dir / "annotations").glob("*.parquet")))
+
+    for meta_path in meta_paths:
+        if meta_path.exists():
+            try:
+                import pandas as pd
+                df = pd.read_parquet(meta_path)
+                print(f"Loaded metadata from {meta_path.name} with {len(df)} entries.")
+                
+                # Normalize index for lookup
+                if "image_name" in df.columns:
+                    df = df.set_index("image_name")
+                elif "iauname" in df.columns:
+                    # GZ Decals: file is often iauname.png
+                    df = df.set_index("iauname")
+                
+                if metadata_df is None:
+                    metadata_df = df
+                else:
+                    # Merge if multiple files (optional, depending on schema)
+                    metadata_df = metadata_df.combine_first(df)
+            except ImportError:
+                print("Warning: pandas or pyarrow not installed, skipping metadata.")
+                break
+            except Exception as e:
+                print(f"Warning: could not load {meta_path.name}: {e}")
 
     kept = 0
     skipped_aspect = 0
@@ -310,15 +338,40 @@ def process_image_dir(
             if src_txt.exists():
                 caption = src_txt.read_text(encoding="utf-8").strip()
             
-            # 2. Check for metadata.parquet
+            # 2. Check for metadata.parquet / GZ Decals
             if not caption and metadata_df is not None:
-                if img_path.name in metadata_df.index:
-                    row = metadata_df.loc[img_path.name]
-                    # diffusiondb prompt column
+                # GZ Decals often has filenames like 'J094651.40-010228.5.png'
+                lookup_key = img_path.stem 
+                if lookup_key in metadata_df.index:
+                    row = metadata_df.loc[lookup_key]
+                    if isinstance(row, pd.DataFrame): # Handle non-unique index
+                        row = row.iloc[0]
+                    
+                    # DiffusionDB
                     if "prompt" in row:
                         caption = str(row["prompt"]).strip()
                     elif "text" in row:
                         caption = str(row["text"]).strip()
+                    # GZ Decals morphology mapping
+                    elif "smooth-or-featured_smooth_fraction" in row:
+                        parts = []
+                        if row.get('smooth-or-featured_smooth_fraction', 0) > 0.5:
+                            parts.append("a smooth galaxy")
+                        elif row.get('smooth-or-featured_featured-or-disk_fraction', 0) > 0.5:
+                            parts.append("a featured galaxy")
+                        else:
+                            parts.append("a galaxy")
+                        
+                        if row.get('disk-edge-on_yes_fraction', 0) > 0.5:
+                            parts.append("seen edge-on")
+                        
+                        if row.get('has-spiral-arms_yes_fraction', 0) > 0.5:
+                            parts.append("with spiral arms")
+                        
+                        if row.get('bar_strong_fraction', 0) > 0.5:
+                            parts.append("and a strong bar")
+                        
+                        caption = " ".join(parts).capitalize() + "."
             
             # 3. Check for alongside .json (DiffusionDB structure part-xxxx.json)
             if not caption:

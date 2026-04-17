@@ -66,6 +66,29 @@ DATASETS = {
         "description": "2k pixel-art images from DiffusionDB with text prompts.",
         "type": "vision"
     },
+    "gz-evo": {
+        "path": "mwalmsley/gz_evo_internal",
+        "description": "Galaxy Zoo Evolution dataset (total ~18.3 GB).",
+        "type": "vision"
+    },
+    "diffusiondb-large": {
+        "path": "poloclub/diffusiondb",
+        "description": "Large DiffusionDB dataset. Each shard is ~750MB.",
+        "type": "vision",
+        "shards": 70,  # Default to ~52 GB
+        "shard_start": 1,
+        "shard_pattern": "images/part-{i:06d}.zip",
+        "extra_files": ["metadata.parquet", "dataset_info.json"]
+    },
+    "gz-decals": {
+        "path": "BigBang/galaxyzoo-decals",
+        "description": "Galaxy Zoo DECaLS dataset. Total ~105 GB. Images in tar.gz shards.",
+        "type": "vision",
+        "shards": 100, # Default to ~50 GB
+        "shard_start": 0,
+        "shard_pattern": "images/J{i:03d}.tar.gz",
+        "extra_files": ["annotations/*.parquet"]
+    },
 
     # --- Other ---
     "wikitext-103": {
@@ -76,11 +99,12 @@ DATASETS = {
     }
 }
 
-def download(name, out_dir=None):
+def download(name, out_dir=None, shard_limit=None):
     try:
         from datasets import load_dataset
+        from huggingface_hub import snapshot_download
     except ImportError:
-        print("Error: 'datasets' library not found. Install it with: pip install datasets")
+        print("Error: 'datasets' or 'huggingface_hub' library not found. Install them with: pip install datasets huggingface_hub")
         return
 
     if name not in DATASETS:
@@ -100,8 +124,35 @@ def download(name, out_dir=None):
 
     print(f"Downloading {name} ({path})...")
     print(f"Description: {info['description']}")
-    
-    # We load as a DatasetDict (all splits)
+
+    # Handle shard-based download if requested
+    shards = shard_limit if shard_limit is not None else info.get("shards")
+    if shards:
+        print(f"Downloading first {shards} shards...")
+        shard_start = info.get("shard_start", 1)
+        shard_pattern = info.get("shard_pattern", "images/part-{i:06d}.zip")
+        
+        allow_patterns = []
+        for i in range(shard_start, shard_start + shards):
+            allow_patterns.append(shard_pattern.format(i=i))
+        
+        # Include extra files (e.g. metadata, annotations) if defined
+        extra_files = info.get("extra_files", [])
+        if isinstance(extra_files, list):
+            allow_patterns.extend(extra_files)
+        else:
+            allow_patterns.append(extra_files)
+
+        snapshot_download(
+            repo_id=path, 
+            repo_type="dataset", 
+            local_dir=str(out_dir),
+            allow_patterns=allow_patterns
+        )
+        print(f"  Downloaded {shards} shards to {out_dir}")
+        return
+
+    # Standard download
     try:
         ds = load_dataset(path, name=config_name, trust_remote_code=True)
         print(f"Saving to {out_dir}...")
@@ -135,6 +186,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="General HuggingFace Dataset Downloader")
     parser.add_argument("--dataset", type=str, help="Name of the dataset to download")
     parser.add_argument("--out-dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--shards", type=int, default=None, help="Number of shards to download (if supported)")
     parser.add_argument("--list", action="store_true", help="List all available datasets")
     
     args = parser.parse_args()
@@ -142,6 +194,6 @@ if __name__ == "__main__":
     if args.list:
         list_datasets()
     elif args.dataset:
-        download(args.dataset, args.out_dir)
+        download(args.dataset, args.out_dir, shard_limit=args.shards)
     else:
         parser.print_help()
