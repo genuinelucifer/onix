@@ -500,6 +500,7 @@ Examples:
         )
 
     # -- Summary --
+    ds_name = input_dir.name
     total = kept + skip_ar + skip_sz + skip_err
     print()
     print("=" * 60)
@@ -520,14 +521,14 @@ Examples:
 
     if txt_count > 0:
         print(f"\n  Ready for VQ-VAE training (Phase 1):")
-        print(f"    python train_vqvae.py --model-name my-vqvae "
+        print(f"    ./run_train.sh {ds_name}-vqvae --mode vqvae "
               f"--config configs/vqvae_default.json --data-dir {output_dir}")
         print(f"\n  Ready for multimodal training (Phase 2):")
-        print(f"    python train_multimodal.py --model-name my-multimodal "
+        print(f"    ./run_train.sh {ds_name}-multimodal --mode multimodal "
               f"--config configs/multimodal_pixelart.json --data-dir {output_dir}")
     else:
         print(f"\n  Ready for VQ-VAE training (Phase 1):")
-        print(f"    python train_vqvae.py --model-name my-vqvae "
+        print(f"    ./run_train.sh {ds_name}-vqvae --mode vqvae "
               f"--config configs/vqvae_default.json --data-dir {output_dir}")
         print(f"\n  No text captions found -- multimodal training (Phase 2) "
               f"requires paired .png + .txt files.")
