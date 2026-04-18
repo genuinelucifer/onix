@@ -10,6 +10,10 @@ The transformer operates on a joint token space:
 
 Loss is computed only on visual token predictions (text positions are masked).
 
+Features:
+  - Early stopping when loss stagnates (after at least 1 epoch)
+  - Graceful --resume when no checkpoint exists (uses saved config)
+
 Usage:
     python train_multimodal.py --model-name my-imggen \
         --config configs/multimodal_pixelart.json \
@@ -42,10 +46,16 @@ from architecture.generate import generate_image
 from pretrain_data.multimodal_dataset import create_multimodal_dataloaders
 
 from model import (
-    get_tokenizer, write_status, set_status_file, get_status_file,
-    save_model_config, load_model_config,
+    get_tokenizer, write_status, save_model_config, load_model_config,
     save_checkpoint, load_checkpoint,
-    MODELS_DIR,
+    get_model_dir, MODELS_DIR,
+)
+
+# Shared training utilities
+from training_utils import (
+    create_optimizer, setup_status_file, setup_device,
+    migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
+    get_train_params, EarlyStopper,
 )
 
 
@@ -105,11 +115,15 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                           model_name, save_every_n_epochs, save_every_n_iters=None,
                           start_epoch=0, start_global_step=-1,
                           prev_train_losses=None, prev_val_losses=None,
-                          frozen_vqvae=None, tokenizer=None):
+                          frozen_vqvae=None, tokenizer=None,
+                          early_stopper=None):
     """Main multi-modal training loop."""
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
     global_step = start_global_step
+
+    # Track completed epochs for early stopping
+    completed_epochs = start_epoch
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -140,12 +154,31 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                     f"train_loss={tl:.4f} val_loss={vl:.4f}"
                 )
 
+                # Early stopping check
+                if early_stopper is not None:
+                    if early_stopper.check(vl, global_step, completed_epochs):
+                        write_status(
+                            f"EARLY_STOP triggered at step {global_step} "
+                            f"({early_stopper.status_message()})"
+                        )
+                        ckpt_path = save_checkpoint(
+                            model_name, model, optimizer, epoch + 1, global_step,
+                            0, train_losses, val_losses, tag="early_stop")
+                        save_checkpoint(
+                            model_name, model, optimizer, epoch + 1, global_step,
+                            0, train_losses, val_losses)
+                        write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
+                        return train_losses, val_losses
+
             if save_every_n_iters and save_every_n_iters > 0 and global_step > 0:
                 if global_step % save_every_n_iters == 0:
                     ckpt_path = save_checkpoint(
                         model_name, model, optimizer, epoch, global_step,
                         0, train_losses, val_losses, tag=f"step{global_step}")
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
+
+        # Epoch completed
+        completed_epochs = epoch + 1
 
         # Generate a sample image after each epoch (if VQ-VAE available)
         if frozen_vqvae is not None and tokenizer is not None:
@@ -163,7 +196,6 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                 # Optionally save the sample image
                 try:
                     from torchvision.utils import save_image
-                    from model import get_model_dir
                     sample_dir = get_model_dir(model_name) / "samples"
                     sample_dir.mkdir(exist_ok=True)
                     # Denormalize from [-1,1] to [0,1]
@@ -245,24 +277,29 @@ Examples:
     parser.add_argument("--no-sdpa", action="store_false", dest="use_sdpa")
     parser.set_defaults(use_sdpa=True)
 
+    # Early stopping
+    parser.add_argument("--patience-evals", type=int, default=6,
+                        help="Stop after N consecutive evals with no improvement "
+                             "(0 to disable). Only active after first full epoch.")
+
     args = parser.parse_args()
 
-    # Status file
-    status_file = get_status_file(args.model_name)
-    set_status_file(status_file)
-    if not args.resume:
-        status_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(status_file, "w") as f:
-            f.write("")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ---- Setup ----
+    setup_status_file(args.model_name, resume=args.resume)
+    device = setup_device()
     write_status(f"START [MULTIMODAL] device={device} model_name={args.model_name}")
 
     tokenizer = get_tokenizer()
 
     if args.resume:
-        write_status("RESUME loading config and checkpoint...")
-        full_cfg = load_model_config(args.model_name)
+        checkpoint_exists = has_checkpoint(args.model_name)
+
+        if checkpoint_exists:
+            write_status("RESUME loading config and checkpoint...")
+            full_cfg = load_model_config(args.model_name)
+        else:
+            full_cfg = handle_resume_no_checkpoint(args.model_name)
+
         train_cfg = full_cfg["training"]
         mm_config = MultiModalConfig.from_dict(full_cfg["multimodal"])
 
@@ -275,18 +312,21 @@ Examples:
         model = CausalLM(transformer_config).to(device)
 
         opt_name = train_cfg.get("optimizer", "adamw")
-        optimizer = _create_optimizer(model, opt_name, train_cfg["lr"])
-        ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
-        model.to(device)
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
+        optimizer = create_optimizer(model, opt_name, train_cfg["lr"])
 
-        start_epoch = ckpt_meta["epoch"]
-        start_step = ckpt_meta["global_step"]
-        prev_tl = ckpt_meta["train_losses"]
-        prev_vl = ckpt_meta["val_losses"]
+        if checkpoint_exists:
+            ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
+            model.to(device)
+            migrate_optimizer_to_device(optimizer, device)
+
+            start_epoch = ckpt_meta["epoch"]
+            start_step = ckpt_meta["global_step"]
+            prev_tl = ckpt_meta["train_losses"]
+            prev_vl = ckpt_meta["val_losses"]
+        else:
+            start_epoch, start_step = 0, -1
+            prev_tl, prev_vl = [], []
+
         batch_size = train_cfg["batch_size"]
 
         if start_epoch >= total_epochs:
@@ -342,7 +382,7 @@ Examples:
         pre_encoded = args.pre_encoded
         batch_size = args.batch_size
 
-        optimizer = _create_optimizer(model, args.optimizer, args.lr)
+        optimizer = create_optimizer(model, args.optimizer, args.lr)
         start_epoch, start_step = 0, -1
         prev_tl, prev_vl = [], []
 
@@ -370,42 +410,37 @@ Examples:
     n_params = sum(p.numel() for p in model.parameters())
     write_status(f"MODEL params={n_params:,}")
 
+    # ---- Early stopper ----
+    early_stopper = None
+    if args.patience_evals > 0:
+        early_stopper = EarlyStopper(
+            patience_evals=args.patience_evals,
+            min_epochs=1,
+        )
+        write_status(f"EARLY_STOP enabled: patience={args.patience_evals} evals, min_epochs=1")
+
     # Train
     t0 = time.time()
-    save_every = train_cfg.get("save_every", args.save_every)
-    save_iters = train_cfg.get("save_iters", args.save_iters)
-    log_freq = train_cfg.get("log_freq", args.log_freq)
-    eval_freq = train_cfg.get("eval_freq", args.eval_freq)
-    eval_iter = train_cfg.get("eval_iter", args.eval_iter)
+    tp = get_train_params(train_cfg, args)
 
     train_multimodal_loop(
         model, train_loader, val_loader, optimizer, device,
         mm_config, total_epochs,
-        log_freq=log_freq, eval_freq=eval_freq, eval_iter=eval_iter,
+        log_freq=tp["log_freq"], eval_freq=tp["eval_freq"], eval_iter=tp["eval_iter"],
         model_name=args.model_name,
-        save_every_n_epochs=save_every,
-        save_every_n_iters=save_iters,
+        save_every_n_epochs=tp["save_every"],
+        save_every_n_iters=tp["save_iters"],
         start_epoch=start_epoch,
         start_global_step=start_step,
         prev_train_losses=prev_tl,
         prev_val_losses=prev_vl,
         frozen_vqvae=frozen_vqvae,
         tokenizer=tokenizer,
+        early_stopper=early_stopper,
     )
 
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE multi-modal training completed in {elapsed:.2f} min")
-
-
-def _create_optimizer(model, opt_name, lr, weight_decay=0.1):
-    opt_name = opt_name.lower()
-    if opt_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif opt_name == "adamw8bit":
-        import bitsandbytes as bnb
-        return bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
-    else:
-        raise ValueError(f"Unknown optimizer: {opt_name}")
 
 
 if __name__ == "__main__":

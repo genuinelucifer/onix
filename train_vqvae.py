@@ -28,9 +28,15 @@ from architecture.losses import vqvae_loss
 from pretrain_data.image_dataset import create_image_dataloaders
 
 from model import (
-    write_status, set_status_file, get_status_file,
-    save_model_config, load_model_config, get_model_dir,
-    MODELS_DIR,
+    write_status, save_model_config, load_model_config,
+    get_model_dir, MODELS_DIR,
+)
+
+# Shared training utilities
+from training_utils import (
+    create_optimizer, setup_status_file, setup_device,
+    migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
+    get_train_params,
 )
 
 
@@ -264,20 +270,20 @@ Examples:
 
     args = parser.parse_args()
 
-    # Status file
-    status_file = get_status_file(args.model_name)
-    set_status_file(status_file)
-    if not args.resume:
-        status_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(status_file, "w") as f:
-            f.write("")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ---- Setup ----
+    setup_status_file(args.model_name, resume=args.resume)
+    device = setup_device()
     write_status(f"START [VQVAE] device={device} model_name={args.model_name}")
 
     if args.resume:
-        write_status("RESUME loading config and checkpoint...")
-        full_cfg = load_model_config(args.model_name)
+        checkpoint_exists = has_checkpoint(args.model_name)
+
+        if checkpoint_exists:
+            write_status("RESUME loading config and checkpoint...")
+            full_cfg = load_model_config(args.model_name)
+        else:
+            full_cfg = handle_resume_no_checkpoint(args.model_name)
+
         train_cfg = full_cfg["training"]
         vqvae_config = VQVAEConfig.from_dict(full_cfg["vqvae"])
 
@@ -286,18 +292,22 @@ Examples:
 
         model = VQVAE(vqvae_config).to(device)
         opt_name = train_cfg.get("optimizer", "adamw")
-        optimizer = _create_optimizer(model, opt_name, train_cfg["lr"])
-        ckpt_meta = load_vqvae_checkpoint(args.model_name, model, optimizer)
-        model.to(device)
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
+        optimizer = create_optimizer(model, opt_name, train_cfg["lr"],
+                                     weight_decay=0.01)
 
-        start_epoch = ckpt_meta["epoch"]
-        start_step = ckpt_meta["global_step"]
-        prev_tl = ckpt_meta["train_losses"]
-        prev_vl = ckpt_meta["val_losses"]
+        if checkpoint_exists:
+            ckpt_meta = load_vqvae_checkpoint(args.model_name, model, optimizer)
+            model.to(device)
+            migrate_optimizer_to_device(optimizer, device)
+
+            start_epoch = ckpt_meta["epoch"]
+            start_step = ckpt_meta["global_step"]
+            prev_tl = ckpt_meta["train_losses"]
+            prev_vl = ckpt_meta["val_losses"]
+        else:
+            start_epoch, start_step = 0, -1
+            prev_tl, prev_vl = [], []
+
         batch_size = train_cfg["batch_size"]
 
         if start_epoch >= total_epochs:
@@ -345,7 +355,8 @@ Examples:
         data_dir = args.data_dir
         batch_size = args.batch_size
 
-        optimizer = _create_optimizer(model, args.optimizer, args.lr)
+        optimizer = create_optimizer(model, args.optimizer, args.lr,
+                                     weight_decay=0.01)
         start_epoch, start_step = 0, -1
         prev_tl, prev_vl = [], []
 
@@ -363,19 +374,15 @@ Examples:
 
     # Train
     t0 = time.time()
-    save_every = train_cfg.get("save_every", args.save_every)
-    save_iters = train_cfg.get("save_iters", args.save_iters)
-    log_freq = train_cfg.get("log_freq", args.log_freq)
-    eval_freq = train_cfg.get("eval_freq", args.eval_freq)
-    eval_iter = train_cfg.get("eval_iter", args.eval_iter)
+    tp = get_train_params(train_cfg, args)
 
     train_vqvae_loop(
         model, train_loader, val_loader, optimizer, device,
         vqvae_config, total_epochs,
-        log_freq=log_freq, eval_freq=eval_freq, eval_iter=eval_iter,
+        log_freq=tp["log_freq"], eval_freq=tp["eval_freq"], eval_iter=tp["eval_iter"],
         model_name=args.model_name,
-        save_every_n_epochs=save_every,
-        save_every_n_iters=save_iters,
+        save_every_n_epochs=tp["save_every"],
+        save_every_n_iters=tp["save_iters"],
         start_epoch=start_epoch,
         start_global_step=start_step,
         prev_train_losses=prev_tl,
@@ -384,18 +391,6 @@ Examples:
 
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE VQ-VAE training completed in {elapsed:.2f} min")
-
-
-def _create_optimizer(model, opt_name, lr, weight_decay=0.01):
-    """Create optimizer for VQ-VAE training."""
-    opt_name = opt_name.lower()
-    if opt_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif opt_name == "adamw8bit":
-        import bitsandbytes as bnb
-        return bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
-    else:
-        raise ValueError(f"Unknown optimizer: {opt_name}")
 
 
 if __name__ == "__main__":

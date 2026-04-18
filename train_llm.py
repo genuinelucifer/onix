@@ -8,6 +8,7 @@ Supports:
   - Custom architecture via JSON config file
   - Small text files or large pre-tokenized shard datasets
   - Automatic resuming from latest checkpoints
+  - Early stopping when loss stagnates (after at least 1 epoch)
 
 Examples:
   # Train with a preset
@@ -39,9 +40,16 @@ from architecture.generate import generate
 # Utilities (shared)
 from model import (
     get_tokenizer, text_to_token_ids, token_ids_to_text,
-    write_status, set_status_file, get_status_file,
-    save_model_config, load_model_config, save_checkpoint, load_checkpoint,
+    write_status, save_model_config, load_model_config,
+    save_checkpoint, load_checkpoint,
     MODELS_DIR,
+)
+
+# Shared training utilities
+from training_utils import (
+    create_optimizer, setup_status_file, setup_device,
+    migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
+    get_train_params, EarlyStopper,
 )
 
 # Data pipeline
@@ -80,14 +88,15 @@ def evaluate(model, train_loader, val_loader, device, eval_iter):
 
 
 # ---------------------------------------------------------------------------
-#  Training loop (works with both CausalLM and legacy GPT2)
+#  Training loop
 # ---------------------------------------------------------------------------
 
 def train_loop(model, train_loader, val_loader, optimizer, device,
                num_epochs, log_freq, eval_freq, eval_iter, start_context, tokenizer,
                model_name, save_every_n_epochs, save_every_n_iters=None,
                start_epoch=0, start_global_step=-1, start_tokens_seen=0,
-               prev_train_losses=None, prev_val_losses=None):
+               prev_train_losses=None, prev_val_losses=None,
+               early_stopper=None):
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
     tokens_seen = start_tokens_seen
@@ -95,6 +104,9 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
 
     # Get context size from model
     ctx_size = model.config.context_length
+
+    # Track completed epochs for early stopping
+    completed_epochs = start_epoch
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -127,6 +139,23 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                     f"tokens={tokens_seen} train_loss={tl:.4f} val_loss={vl:.4f}"
                 )
 
+                # Early stopping check
+                if early_stopper is not None:
+                    if early_stopper.check(vl, global_step, completed_epochs):
+                        write_status(
+                            f"EARLY_STOP triggered at step {global_step} "
+                            f"({early_stopper.status_message()})"
+                        )
+                        # Save checkpoint before stopping
+                        ckpt_path = save_checkpoint(
+                            model_name, model, optimizer, epoch + 1, global_step,
+                            tokens_seen, train_losses, val_losses, tag="early_stop")
+                        save_checkpoint(
+                            model_name, model, optimizer, epoch + 1, global_step,
+                            tokens_seen, train_losses, val_losses)
+                        write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
+                        return train_losses, val_losses
+
             # Iteration checkpoint
             if save_every_n_iters is not None and save_every_n_iters > 0 and global_step > 0:
                 if global_step % save_every_n_iters == 0:
@@ -135,6 +164,9 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                         model_name, model, optimizer, epoch, global_step,
                         tokens_seen, train_losses, val_losses, tag=f"step{global_step}")
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
+
+        # Epoch completed
+        completed_epochs = epoch + 1
 
         # Generate a sample after each epoch
         model.eval()
@@ -178,32 +210,6 @@ def create_model_from_config(config: ModelConfig, device: torch.device) -> Causa
     return model
 
 
-def create_optimizer(model, opt_name, lr, weight_decay=0.1):
-    """Create optimizer with support for 8-bit variants via bitsandbytes."""
-    opt_name = opt_name.lower()
-    if opt_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif opt_name == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif opt_name in ("adamw8bit", "sgd8bit"):
-        try:
-            import bitsandbytes as bnb
-            if opt_name == "adamw8bit":
-                return bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
-            else:
-                # Note: bnb SGD doesn't always support weight_decay in the same way,
-                # but we'll try to keep it consistent.
-                return bnb.optim.SGD8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
-        except ImportError:
-            # Re-wrap error for better UX
-            raise ImportError(
-                f"Optimizer '{opt_name}' requires the 'bitsandbytes' library. "
-                "Please install it with: pip install bitsandbytes"
-            )
-    else:
-        raise ValueError(f"Unknown optimizer: {opt_name}")
-
-
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -220,9 +226,6 @@ Examples:
 
   # Custom config file
   python train.py --mode llm --model-name my-custom --config my_config.json --data ../the-verdict.txt
-
-  # Legacy GPT-2 mode
-  python train.py --mode llm --model-name verdict-gpt --data ../the-verdict.txt --model-size 124M
 
   # Resume any model
   python train.py --model-name my-llama --resume
@@ -268,6 +271,11 @@ Examples:
     parser.add_argument("--max-shards", type=int, default=None,
                         help="Limit number of data shards (for testing)")
 
+    # Early stopping
+    parser.add_argument("--patience-evals", type=int, default=6,
+                        help="Stop after N consecutive evals with no improvement "
+                             "(0 to disable). Only active after first full epoch.")
+
     # Optimization args
     opt_group = parser.add_argument_group("Optimization & Memory")
     opt_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
@@ -281,23 +289,24 @@ Examples:
 
     args = parser.parse_args()
 
-    # ---- Setup status file ----
-    status_file = get_status_file(args.model_name)
-    set_status_file(status_file)
-    if not args.resume:
-        status_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(status_file, "w") as f:
-            f.write("")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ---- Setup ----
+    setup_status_file(args.model_name, resume=args.resume)
+    device = setup_device()
     write_status(f"START device={device} model_name={args.model_name} resume={args.resume}")
 
     tokenizer = get_tokenizer()
 
     if args.resume:
         # ---- Resume mode ----
-        write_status("RESUME loading config and checkpoint...")
-        full_cfg = load_model_config(args.model_name)
+        checkpoint_exists = has_checkpoint(args.model_name)
+
+        if checkpoint_exists:
+            write_status("RESUME loading config and checkpoint...")
+            full_cfg = load_model_config(args.model_name)
+        else:
+            # No checkpoint — use saved config, start fresh
+            full_cfg = handle_resume_no_checkpoint(args.model_name)
+
         train_cfg = full_cfg["training"]
 
         total_epochs = args.epochs if args.epochs != 10 else train_cfg["epochs"]
@@ -311,7 +320,6 @@ Examples:
             model = CausalLM(model_config).to(device)
             write_status(f"RESUMED architecture: {model_config.name}")
         else:
-            # Fallback for old legacy checkpoints
             raise ValueError(
                 "This trainer no longer supports legacy GPT2 class models. "
                 "Please use a previous version of YALLM or convert the state_dict."
@@ -319,18 +327,21 @@ Examples:
 
         opt_name = train_cfg.get("optimizer", "adamw")
         optimizer = create_optimizer(model, opt_name, lr=train_cfg["lr"])
-        ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
-        model.to(device)
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
 
-        start_epoch = ckpt_meta["epoch"]
-        start_step = ckpt_meta["global_step"]
-        start_tokens = ckpt_meta["tokens_seen"]
-        prev_tl = ckpt_meta["train_losses"]
-        prev_vl = ckpt_meta["val_losses"]
+        if checkpoint_exists:
+            ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
+            model.to(device)
+            migrate_optimizer_to_device(optimizer, device)
+
+            start_epoch = ckpt_meta["epoch"]
+            start_step = ckpt_meta["global_step"]
+            start_tokens = ckpt_meta["tokens_seen"]
+            prev_tl = ckpt_meta["train_losses"]
+            prev_vl = ckpt_meta["val_losses"]
+        else:
+            # Fresh start with existing config
+            start_epoch, start_step, start_tokens = 0, -1, 0
+            prev_tl, prev_vl = [], []
 
         if start_epoch >= total_epochs:
             write_status(f"Already trained {start_epoch} epochs (target={total_epochs}). "
@@ -432,29 +443,35 @@ Examples:
     n_params = sum(p.numel() for p in model.parameters())
     write_status(f"MODEL params={n_params:,}")
 
+    # ---- Early stopper ----
+    early_stopper = None
+    if args.patience_evals > 0:
+        early_stopper = EarlyStopper(
+            patience_evals=args.patience_evals,
+            min_epochs=1,
+        )
+        write_status(f"EARLY_STOP enabled: patience={args.patience_evals} evals, min_epochs=1")
+
     # ---- Train ----
     t0 = time.time()
-    save_every = train_cfg.get("save_every", args.save_every)
-    save_iters = train_cfg.get("save_iters", args.save_iters)
-    log_freq = train_cfg.get("log_freq", args.log_freq)
-    eval_freq = train_cfg.get("eval_freq", args.eval_freq)
-    eval_iter = train_cfg.get("eval_iter", args.eval_iter)
+    tp = get_train_params(train_cfg, args)
 
     train_loop(model, train_loader, val_loader, optimizer, device,
                num_epochs=total_epochs,
-               log_freq=log_freq,
-               eval_freq=eval_freq,
-               eval_iter=eval_iter,
+               log_freq=tp["log_freq"],
+               eval_freq=tp["eval_freq"],
+               eval_iter=tp["eval_iter"],
                start_context="Every effort moves you",
                tokenizer=tokenizer,
                model_name=args.model_name,
-               save_every_n_epochs=save_every,
-               save_every_n_iters=save_iters,
+               save_every_n_epochs=tp["save_every"],
+               save_every_n_iters=tp["save_iters"],
                start_epoch=start_epoch,
                start_global_step=start_step,
                start_tokens_seen=start_tokens,
                prev_train_losses=prev_tl,
-               prev_val_losses=prev_vl)
+               prev_val_losses=prev_vl,
+               early_stopper=early_stopper)
 
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE training completed in {elapsed:.2f} min")
