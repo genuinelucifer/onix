@@ -205,7 +205,7 @@ class VectorQuantizer(nn.Module):
         quantized_flat = self.embedding(indices)  # (N, D)
 
         # Compute codebook usage (fraction of entries used in this batch)
-        unique_codes = indices.unique().numel()
+        unique_codes = indices.cpu().unique().numel()
         usage = unique_codes / self.n_embed
 
         # EMA codebook update (during training only)
@@ -233,6 +233,27 @@ class VectorQuantizer(nn.Module):
                     self.ema_embed_sum / cluster_size_smooth.unsqueeze(1)
                 )
 
+                # Reset "dead" codes: if an entry hasn't been used, replace it with a random 
+                # vector from the current batch. This significantly improves codebook utilization.
+                if self.training:
+                    # Threshold for 'dead' code - entries with very low EMA cluster size
+                    dead_indices = torch.nonzero(self.ema_cluster_size < 1.0).flatten()
+                    if dead_indices.numel() > 0:
+                        # Pick random vectors from the current input batch
+                        z_flat_reset = z_flat.detach()
+                        indices_to_pick = torch.randperm(z_flat_reset.shape[0], device=z_flat_reset.device)[:dead_indices.numel()]
+                        
+                        # If batch is smaller than dead indices, repeat batch items
+                        if indices_to_pick.numel() < dead_indices.numel():
+                            indices_to_pick = indices_to_pick.repeat((dead_indices.numel() // indices_to_pick.numel()) + 1)[:dead_indices.numel()]
+                            
+                        new_embeddings = z_flat_reset[indices_to_pick]
+                        
+                        # Apply reset
+                        self.embedding.weight.data[dead_indices] = new_embeddings
+                        self.ema_cluster_size[dead_indices] = 1.0  # Reset size to 1.0 to avoid immediate re-reset
+                        self.ema_embed_sum[dead_indices] = new_embeddings * 1.0
+
         # Commitment loss: encourage encoder output to stay close to codebook
         commitment_loss = F.mse_loss(z_flat.detach(), quantized_flat) + \
                           self.commitment_weight * F.mse_loss(z_flat, quantized_flat.detach())
@@ -241,7 +262,7 @@ class VectorQuantizer(nn.Module):
         quantized_flat = z_flat + (quantized_flat - z_flat).detach()
 
         # Reshape back to spatial
-        quantized = quantized_flat.reshape(B, h, w, D).permute(0, 3, 1, 2)  # (B, D, h, w)
+        quantized = quantized_flat.reshape(B, h, w, D).permute(0, 3, 1, 2).contiguous()  # (B, D, h, w)
         indices = indices.reshape(B, h * w)  # (B, h*w)
 
         return VQOutput(quantized, indices, commitment_loss, usage)
@@ -356,17 +377,24 @@ class VQVAE(nn.Module):
             vq_loss: scalar (commitment + codebook loss)
             indices: (B, num_visual_tokens) codebook indices
         """
-        z = self.encoder(x)
-
         if self.config.grad_checkpointing and self.training:
-            # Quantizer has non-trivial memory usage
+            # Checkpoint encoder, quantizer, and decoder to reduce peak
+            # activation memory and change MIOpen workspace allocation pattern
+            # (works around hipErrorLaunchFailure on some AMD GPUs).
+            z = torch.utils.checkpoint.checkpoint(
+                self.encoder, x, use_reentrant=False
+            )
             vq_out = torch.utils.checkpoint.checkpoint(
                 self.quantizer, z, use_reentrant=False
             )
+            recon = torch.utils.checkpoint.checkpoint(
+                self.decoder, vq_out.quantized, use_reentrant=False
+            )
         else:
+            z = self.encoder(x)
             vq_out = self.quantizer(z)
+            recon = self.decoder(vq_out.quantized)
 
-        recon = self.decoder(vq_out.quantized)
         return recon, vq_out.commitment_loss, vq_out.indices
 
     @torch.no_grad()

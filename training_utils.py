@@ -139,19 +139,49 @@ def has_checkpoint(model_name, tag="latest"):
 #  Training parameter extraction
 # ---------------------------------------------------------------------------
 
-_TRAIN_PARAM_KEYS = [
+# Cosmetic: safe to change even if resuming from a checkpoint
+_COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
 ]
 
+# Functional: potentially disruptive to change mid-training if a checkpoint exists
+_FUNCTIONAL_PARAMS = [
+    "batch_size", "lr", "optimizer"
+]
 
-def get_train_params(train_cfg, args):
-    """Extract training hyperparams, preferring saved config over CLI defaults.
 
-    Returns a dict with keys: save_every, save_iters, log_freq, eval_freq, eval_iter.
+def get_train_params(train_cfg, args, has_checkpoint: bool = False):
+    """Extract training hyperparams from CLI and saved config.
+
+    Rules for overrides:
+    1. Cosmetic params (logs, save frequency) can always be overridden by CLI.
+    2. Functional params (batch_size, LR) can only be overridden if no checkpoint exists
+       (i.e., a fresh start or resume-without-checkpoint).
+
+    Returns a dict with all parameters populated.
     """
     result = {}
-    for key in _TRAIN_PARAM_KEYS:
-        result[key] = train_cfg.get(key, getattr(args, key.replace("-", "_"), None))
+
+    # 1. Start with everything from the saved config
+    result.update(train_cfg)
+
+    # 2. Check for CLI overrides
+    # All cosmetic params are allowed
+    for key in _COSMETIC_PARAMS:
+        val = getattr(args, key, None)
+        if val is not None:
+            # Only override if the user didn't leave it at total default (argparse check)
+            # Actually, we can just check if it's explicitly provided if we change the defaults 
+            # to None in the training scripts. For now, we'll check if they differ.
+            result[key] = val
+
+    # 3. Functional params are only allowed if we haven't reached a checkpoint yet
+    if not has_checkpoint:
+        for key in _FUNCTIONAL_PARAMS:
+            val = getattr(args, key, None)
+            if val is not None:
+                result[key] = val
+
     return result
 
 

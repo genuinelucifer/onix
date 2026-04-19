@@ -17,15 +17,27 @@ cd "$SCRIPT_DIR"
 # Activate venv
 source ~/repos/pytorch_env/bin/activate
 
-# Force experimental Flash/Mem-Eff Attention on AMD Consumer GPUs (Breaks VQ-VAE Convs)
-if [[ " $* " != *" --mode vqvae "* ]]; then
-    export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-fi
 
 MODEL_NAME="${1:?Usage: $0 <model_name> [--mode <llm|vqvae|multimodal>] [--preset <preset> | --config <file>] [extra args]}"
 shift
 
 MODELS_DIR="$SCRIPT_DIR/models"
+
+# Force experimental Flash/Mem-Eff Attention on AMD Consumer GPUs
+# (Breaks VQ-VAE Convs, so we skip it for VQ-VAE mode)
+IS_VQVAE=0
+if [[ " $* " == *" --mode vqvae "* ]] || [[ "$MODEL_NAME" == *"vqvae"* ]]; then
+    IS_VQVAE=1
+fi
+if [[ " $* " == *" --resume "* ]] && [ -f "$MODELS_DIR/$MODEL_NAME/config.json" ]; then
+    if grep -q '"model_type": "vqvae"' "$MODELS_DIR/$MODEL_NAME/config.json" 2>/dev/null; then
+        IS_VQVAE=1
+    fi
+fi
+
+if [ "$IS_VQVAE" -eq 0 ]; then
+    export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+fi
 
 # Build args list
 ARGS=(--model-name "$MODEL_NAME")

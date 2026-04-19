@@ -25,6 +25,13 @@ from architecture.config import VQVAEConfig
 from architecture.vqvae import VQVAE
 from architecture.losses import vqvae_loss
 
+try:
+    import torchvision
+    from torchvision.utils import save_image, make_grid
+    HAS_TORCHVISION = True
+except ImportError:
+    HAS_TORCHVISION = False
+
 from pretrain_data.image_dataset import create_image_dataloaders
 
 from model import (
@@ -136,6 +143,34 @@ def evaluate_vqvae(model, val_loader, device, vqvae_config, num_batches=None):
     return total_recon / n, total_vq / n, total_usage / n
 
 
+def save_reconstruction_samples(model, loader, device, model_name, step):
+    """Save a grid of original vs. reconstructed images from the validation set."""
+    if not HAS_TORCHVISION:
+        return
+
+    model.eval()
+    with torch.no_grad():
+        # Get a single batch
+        images = next(iter(loader))
+        images = images[:8].to(device)  # Take up to 8 images
+
+        # Reconstruct
+        recon, _, _ = model(images)
+
+        # Prepare grid: [orig1, recon1, orig2, recon2, ...]
+        combined = torch.stack([images, recon], dim=1).flatten(0, 1)
+        grid = make_grid(combined, nrow=4, normalize=True, value_range=(-1, 1))
+
+        # Save
+        sample_dir = get_model_dir(model_name) / "samples"
+        sample_dir.mkdir(exist_ok=True)
+        save_path = sample_dir / f"step_{step:06d}.png"
+        save_image(grid, save_path)
+        write_status(f"SAMPLE images saved to {save_path}")
+
+    model.train()
+
+
 # ---------------------------------------------------------------------------
 #  Training loop
 # ---------------------------------------------------------------------------
@@ -193,6 +228,8 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                     f"val_loss={recon_l + vq_l:.4f} val_recon={recon_l:.4f} val_vq={vq_l:.4f} "
                     f"codebook_usage={usage:.2%}"
                 )
+                # Save visual samples
+                save_reconstruction_samples(model, val_loader, device, model_name, global_step)
 
             if save_every_n_iters and save_every_n_iters > 0 and global_step > 0:
                 if global_step % save_every_n_iters == 0:
@@ -281,11 +318,17 @@ Examples:
         if checkpoint_exists:
             write_status("RESUME loading config and checkpoint...")
             full_cfg = load_model_config(args.model_name)
+            has_ckpt = True
         else:
             full_cfg = handle_resume_no_checkpoint(args.model_name)
+            has_ckpt = False
 
         train_cfg = full_cfg["training"]
         vqvae_config = VQVAEConfig.from_dict(full_cfg["vqvae"])
+
+        # Override checkpointing if requested
+        if args.checkpointing:
+            vqvae_config.grad_checkpointing = True
 
         total_epochs = args.epochs if args.epochs != 100 else train_cfg["epochs"]
         data_dir = train_cfg["data_dir"]
@@ -328,6 +371,7 @@ Examples:
         write_status(f"CONFIG loaded from {args.config}")
 
         model = VQVAE(vqvae_config).to(device)
+        has_ckpt = False
         write_status(f"MODEL created:\n{model.summary()}")
 
         # Save config
@@ -374,7 +418,10 @@ Examples:
 
     # Train
     t0 = time.time()
-    tp = get_train_params(train_cfg, args)
+    tp = get_train_params(train_cfg, args, has_checkpoint=has_ckpt)
+
+    # Initial sample
+    save_reconstruction_samples(model, val_loader, device, args.model_name, max(0, start_step))
 
     train_vqvae_loop(
         model, train_loader, val_loader, optimizer, device,
