@@ -91,7 +91,13 @@ def load_checkpoint(model_name, model, optimizer=None, tag="latest"):
     if not ckpt_path.exists():
         raise FileNotFoundError(f"No checkpoint_{tag}.pt found in {d}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    
+    # Strip torch.compile prefix (_orig_mod.) if present in the checkpoint
+    state_dict = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        
+    model.load_state_dict(state_dict)
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     return {

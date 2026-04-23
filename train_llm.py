@@ -73,8 +73,11 @@ def calc_loss_loader(loader, model, device, num_batches=None, use_bf16=False):
     n = min(num_batches, len(loader)) if num_batches else len(loader)
     total = 0.0
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-        for i, (inp, tgt) in enumerate(loader):
-            if i >= n:
+        loader_iter = iter(loader)
+        for _ in range(n):
+            try:
+                inp, tgt = next(loader_iter)
+            except StopIteration:
                 break
             total += calc_loss_batch(inp, tgt, model, device).item()
     return total / n
@@ -145,6 +148,10 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                 # Early stopping check
                 if early_stopper is not None:
                     if early_stopper.check(vl, global_step, completed_epochs):
+                        # Sync CUDA before saving to prevent race conditions on exit
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+
                         write_status(
                             f"EARLY_STOP triggered at step {global_step} "
                             f"({early_stopper.status_message()})"
@@ -157,6 +164,18 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                             model_name, model, optimizer, epoch + 1, global_step,
                             tokens_seen, train_losses, val_losses)
                         write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
+
+                        # Final sample before return
+                        try:
+                            model.eval()
+                            enc = text_to_token_ids(start_context, tokenizer).to(device)
+                            with torch.no_grad():
+                                gen = generate(model, enc, max_new_tokens=50, context_size=ctx_size)
+                            sample = token_ids_to_text(gen, tokenizer).replace("\n", " ")
+                            write_status(f"FINAL SAMPLE: {sample}")
+                        except Exception as e:
+                            write_status(f"FINAL SAMPLE failed: {e}")
+
                         return train_losses, val_losses
 
             # Iteration checkpoint

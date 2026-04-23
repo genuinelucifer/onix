@@ -5,29 +5,16 @@ YALLM Multi-Modal LLM Training Script (Phase 2)
 Train a decoder-only transformer to generate visual tokens from text prompts.
 Uses a frozen VQ-VAE (trained in Phase 1) as the image tokenizer.
 
-The transformer operates on a joint token space:
-    text BPE tokens | visual codebook tokens | <IMG_START> | <IMG_END>
-
-Loss is computed only on visual token predictions (text positions are masked).
-
 Features:
   - Early stopping when loss stagnates (after at least 1 epoch)
   - Graceful --resume when no checkpoint exists (uses saved config)
+  - CUDA synchronization and explicit cleanup for stability on ROCm
 
 Usage:
     python train_multimodal.py --model-name my-imggen \
         --config configs/multimodal_pixelart.json \
         --data-dir /path/to/image_text_pairs/ \
         --epochs 50
-
-    # With pre-encoded data (faster)
-    python train_multimodal.py --model-name my-imggen \
-        --config configs/multimodal_pixelart.json \
-        --data-dir pretrain_data/encoded_pixelart/ \
-        --pre-encoded --epochs 50
-
-    # Resume
-    python train_multimodal.py --model-name my-imggen --resume
 """
 
 import argparse
@@ -36,6 +23,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torchvision.utils import save_image
 
 from architecture.config import ModelConfig, VQVAEConfig, MultiModalConfig
 from architecture.model import CausalLM
@@ -79,8 +67,12 @@ def evaluate_mm(model, val_loader, device, num_batches=None, use_bf16=False):
     n = 0
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-            for i, (inp, tgt, mask) in enumerate(val_loader):
-                if num_batches and i >= num_batches:
+            # Use iterator to allow early break without worker leakage
+            loader_iter = iter(val_loader)
+            for i in range(num_batches if num_batches else len(val_loader)):
+                try:
+                    inp, tgt, mask = next(loader_iter)
+                except StopIteration:
                     break
                 total += calc_loss_batch_mm(inp, tgt, mask, model, device).item()
                 n += 1
@@ -160,6 +152,10 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                 # Early stopping check
                 if early_stopper is not None:
                     if early_stopper.check(vl, global_step, completed_epochs):
+                        # Ensure all GPU work is done before saving and exiting to avoid IPC errors
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+
                         write_status(
                             f"EARLY_STOP triggered at step {global_step} "
                             f"({early_stopper.status_message()})"
@@ -171,6 +167,24 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                             model_name, model, optimizer, epoch + 1, global_step,
                             0, train_losses, val_losses)
                         write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
+
+                        # Final sample before return
+                        if frozen_vqvae is not None and tokenizer is not None:
+                            try:
+                                model.eval()
+                                sample_prompt = "A colorful pixel art character"
+                                image, _ = generate_image(
+                                    model, frozen_vqvae, sample_prompt, tokenizer, mm_config,
+                                    temperature=0.9, top_k=100,
+                                )
+                                write_status(f"FINAL SAMPLE: generated image from \"{sample_prompt}\"")
+                                try:
+                                    sample_dir = get_model_dir(model_name) / "samples"
+                                    save_image((image.squeeze(0) + 1) / 2, sample_dir / "early_stop.png")
+                                except Exception: pass
+                            except Exception as e:
+                                write_status(f"FINAL SAMPLE failed: {e}")
+
                         return train_losses, val_losses
 
             if save_every_n_iters and save_every_n_iters > 0 and global_step > 0:
@@ -196,12 +210,9 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                     f"SAMPLE epoch={epoch+1}: generated image from \"{sample_prompt}\" "
                     f"(shape={tuple(image.shape)})"
                 )
-                # Optionally save the sample image
                 try:
-                    from torchvision.utils import save_image
                     sample_dir = get_model_dir(model_name) / "samples"
                     sample_dir.mkdir(exist_ok=True)
-                    # Denormalize from [-1,1] to [0,1]
                     save_image(
                         (image.squeeze(0) + 1) / 2,
                         sample_dir / f"epoch_{epoch+1:03d}.png"
@@ -257,6 +268,7 @@ def main():
 
     args = parser.parse_args()
 
+    t0 = time.time()
     # ---- Setup ----
     setup_status_file(args.model_name, resume=args.resume)
     device = setup_device()
@@ -279,25 +291,9 @@ def main():
         data_dir = train_cfg.get("data_dir")
         pre_encoded = train_cfg.get("pre_encoded", False)
 
-        # Build transformer config with correct vocab/context
         transformer_config = mm_config.build_transformer_config()
         model = CausalLM(transformer_config).to(device)
-
-        if checkpoint_exists:
-            # We don't create optimizer here yet; get_train_params will tell us which one
-            pass
-        else:
-            # For resume-no-checkpoint, we'll need an optimizer
-            opt_name = train_cfg.get("optimizer", "adamw")
-            optimizer = create_optimizer(model, opt_name, train_cfg["lr"])
-
-        if checkpoint_exists:
-            # We'll load the checkpoint AFTER merging params
-            start_epoch, start_step = 0, -1
-            prev_tl, prev_vl = [], []
-        else:
-            start_epoch, start_step = 0, -1
-            prev_tl, prev_vl = [], []
+        start_epoch, start_step, prev_tl, prev_vl = 0, -1, [], []
     else:
         if not args.config:
             parser.error("--config is required for new multi-modal training")
@@ -307,7 +303,6 @@ def main():
         mm_config = MultiModalConfig.load(args.config)
         write_status(f"CONFIG loaded from {args.config}")
 
-        # Build transformer config with auto-computed vocab/context
         transformer_config = mm_config.build_transformer_config()
         if args.checkpointing:
             transformer_config.grad_checkpointing = True
@@ -316,28 +311,21 @@ def main():
         torch.manual_seed(123)
         model = CausalLM(transformer_config).to(device)
         write_status(f"MODEL created:\n{model.summary()}")
-        write_status(f"\n{mm_config.summary()}")
 
-        # Set initial training config with defaults
         train_cfg = get_default_training_config("multimodal", args)
         train_cfg["data_dir"] = args.data_dir
         train_cfg["pre_encoded"] = args.pre_encoded
 
-        full_cfg = {
+        save_model_config(args.model_name, {
             "model_type": "multimodal",
             "multimodal": mm_config.to_dict(),
             "architecture": transformer_config.to_dict(),
             "training": train_cfg,
-        }
-        save_model_config(args.model_name, full_cfg)
+        })
 
         data_dir = args.data_dir
         pre_encoded = args.pre_encoded
-
-        optimizer = create_optimizer(model, train_cfg["optimizer"], train_cfg["lr"])
-        start_epoch, start_step = 0, -1
-        prev_tl, prev_vl = [], []
-        checkpoint_exists = False
+        start_epoch, start_step, prev_tl, prev_vl, checkpoint_exists = 0, -1, [], [], False
 
     # Load frozen VQ-VAE
     frozen_vqvae = None
@@ -346,13 +334,8 @@ def main():
             mm_config.vqvae, mm_config.vqvae_checkpoint, device
         )
     else:
-        write_status(
-            f"WARNING: VQ-VAE checkpoint not found at '{mm_config.vqvae_checkpoint}'. "
-            f"Image sampling during training will be disabled."
-        )
+        write_status(f"WARNING: VQ-VAE checkpoint not found at '{mm_config.vqvae_checkpoint}'.")
 
-    # ---- Merge parameters ----
-    # Resolve final training parameters
     tp = get_train_params("multimodal", train_cfg, args, has_checkpoint=checkpoint_exists)
 
     # Load data
@@ -367,45 +350,27 @@ def main():
     write_status(f"DATA: {data_info}")
     write_status(f"LOADERS train={len(train_loader)} val={len(val_loader)} batches")
 
-    n_params = sum(p.numel() for p in model.parameters())
-    write_status(f"MODEL params={n_params:,}")
-
-    # ---- Train ----
-    t0 = time.time()
-
     if args.resume and checkpoint_exists:
-        # Now that we have merged params, we can create optimizer and load checkpoint
         optimizer = create_optimizer(model, tp["optimizer"], tp["lr"])
         ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
         model.to(device)
         migrate_optimizer_to_device(optimizer, device)
-
-        start_epoch = ckpt_meta["epoch"]
-        start_step = ckpt_meta["global_step"]
-        prev_tl = ckpt_meta["train_losses"]
-        prev_vl = ckpt_meta["val_losses"]
-
+        start_epoch, start_step, prev_tl, prev_vl = ckpt_meta["epoch"], ckpt_meta["global_step"], ckpt_meta["train_losses"], ckpt_meta["val_losses"]
         if start_epoch >= tp["epochs"]:
             write_status(f"Already trained {start_epoch} epochs (target={tp['epochs']}).")
             return
-        write_status(f"RESUMED from epoch={start_epoch+1} step={start_step} -> training to epoch {tp['epochs']}")
+    else:
+        optimizer = create_optimizer(model, tp["optimizer"], tp["lr"])
 
-    # ---- Early stopper ----
     early_stopper = None
     if tp["patience"] > 0:
         early_stopper = EarlyStopper(
-            patience_evals=tp["patience"],
-            min_delta=tp["min_delta"],
-            min_epochs=tp["min_epochs"],
-            window_size=tp["window_size"],
+            patience_evals=tp["patience"], min_delta=tp["min_delta"],
+            min_epochs=tp["min_epochs"], window_size=tp["window_size"],
         )
-        write_status(f"EARLY_STOP enabled: patience={tp['patience']} evals, "
-                     f"min_delta={tp['min_delta']}, min_epochs={tp['min_epochs']}, "
-                     f"window={tp['window_size']}")
 
-    # ---- Compile ----
     if tp["compile"]:
-        write_status("torch.compile: Compiling model... (This will take a few minutes)")
+        write_status("torch.compile: Compiling model...")
         model = torch.compile(model)
 
     train_multimodal_loop(
@@ -424,7 +389,7 @@ def main():
         early_stopper=early_stopper,
         use_bf16=tp["bf16"],
     )
-
+    
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE multi-modal training completed in {elapsed:.2f} min")
 

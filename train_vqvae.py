@@ -235,6 +235,10 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                 # Early stopping check
                 if early_stopper is not None:
                     if early_stopper.check(val_loss, global_step, completed_epochs):
+                        # Ensure all GPU work is done before saving and exiting
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+
                         write_status(
                             f"EARLY_STOP triggered at step {global_step} "
                             f"({early_stopper.status_message()})"
@@ -427,7 +431,6 @@ def main():
         early_stopper=stopper,
         use_bf16=tp["bf16"],
     )
-
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE VQ-VAE training completed in {elapsed:.2f} min")
 

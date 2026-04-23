@@ -180,7 +180,9 @@ DEFAULT_CONFIGS = {
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
         "bf16": False,
-        "num_workers": 0, "pin_memory": False, "prefetch_factor": 2,
+        "num_workers": 0,    # Recommended: 0 for online encoding with GPU models to avoid IPC issues
+        "pin_memory": False,
+        "prefetch_factor": 2,
         "compile": False,
     }
 }
