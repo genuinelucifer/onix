@@ -39,6 +39,17 @@ if [ "$IS_VQVAE" -eq 0 ]; then
     export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 fi
 
+# Safety check: is model already training?
+if [ -f "$MODELS_DIR/$MODEL_NAME/.pid" ]; then
+    PID=$(cat "$MODELS_DIR/$MODEL_NAME/.pid")
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "ERROR: Training is already running for '$MODEL_NAME' (PID $PID)."
+        echo "Check status: tail -f $MODELS_DIR/$MODEL_NAME/status.txt"
+        echo "To stop it first: kill $PID"
+        exit 1
+    fi
+fi
+
 # Build args list
 ARGS=(--model-name "$MODEL_NAME")
 
