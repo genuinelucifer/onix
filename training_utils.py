@@ -143,7 +143,7 @@ def has_checkpoint(model_name, tag="latest"):
 _COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
     "patience", "min_delta", "min_epochs", "window_size", "bf16",
-    "num_workers", "pin_memory", "prefetch_factor",
+    "num_workers", "pin_memory", "prefetch_factor", "compile",
 ]
 
 # Functional: potentially disruptive to change mid-training if a checkpoint exists
@@ -161,6 +161,7 @@ DEFAULT_CONFIGS = {
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
         "bf16": False,
         "num_workers": 0, "pin_memory": False, "prefetch_factor": 2,
+        "compile": False,
     },
     "vqvae": {
         "epochs": 100, "batch_size": 16, "lr": 3e-4,
@@ -170,6 +171,7 @@ DEFAULT_CONFIGS = {
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
         "bf16": False,
         "num_workers": 4, "pin_memory": True, "prefetch_factor": 2,
+        "compile": False,
     },
     "multimodal": {
         "epochs": 50, "batch_size": 32, "lr": 4e-4,
@@ -179,6 +181,7 @@ DEFAULT_CONFIGS = {
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
         "bf16": False,
         "num_workers": 0, "pin_memory": False, "prefetch_factor": 2,
+        "compile": False,
     }
 }
 
@@ -241,6 +244,8 @@ def add_common_training_args(parser):
                             help="Enable pin_memory for faster RAM-to-GPU transfer")
     data_group.add_argument("--prefetch-factor", type=int, default=None,
                             help="Number of batches to prefetch per worker")
+    parser.add_argument("--compile", action="store_true", default=None,
+                        help="Enable torch.compile for kernel fusion (faster math)")
 
     return parser
 

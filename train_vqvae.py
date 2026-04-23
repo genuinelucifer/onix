@@ -408,6 +408,11 @@ def main():
     # Initial sample
     save_reconstruction_samples(model, val_loader, device, args.model_name, max(0, start_step))
 
+    # ---- Compile ----
+    if tp["compile"]:
+        write_status("torch.compile: Compiling model... (This will take a few minutes)")
+        model = torch.compile(model)
+
     train_vqvae_loop(
         model, train_loader, val_loader, optimizer, device,
         vqvae_config, tp["epochs"],

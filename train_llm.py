@@ -417,6 +417,11 @@ def main():
                      f"min_delta={tp['min_delta']}, min_epochs={tp['min_epochs']}, "
                      f"window={tp['window_size']}")
 
+    # ---- Compile ----
+    if tp["compile"]:
+        write_status("torch.compile: Compiling model... (This will take a few minutes)")
+        model = torch.compile(model)
+
     train_loop(model, train_loader, val_loader, optimizer, device,
                num_epochs=tp["epochs"],
                log_freq=tp["log_freq"],
