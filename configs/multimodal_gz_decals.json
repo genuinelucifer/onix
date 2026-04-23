@@ -1,0 +1,35 @@
+{
+    "transformer": {
+        "name": "gz-decals-mm-125m",
+        "vocab_size": 50771,
+        "context_length": 1282,
+        "emb_dim": 768,
+        "n_layers": 12,
+        "n_heads": 12,
+        "n_kv_heads": 4,
+        "attn_bias": false,
+        "attn_dropout": 0.0,
+        "use_sdpa": true,
+        "pos_encoding": "rope",
+        "norm_type": "rmsnorm",
+        "ffn_type": "swiglu",
+        "block_type": "sequential"
+    },
+    "vqvae": {
+        "name": "vqvae-tiny",
+        "image_size": 256,
+        "image_channels": 3,
+        "base_channels": 32,
+        "channel_multipliers": [1, 2, 4, 4],
+        "num_res_blocks": 1,
+        "codebook_size": 512,
+        "codebook_dim": 64,
+        "commitment_weight": 0.25,
+        "ema_decay": 0.99,
+        "loss_type": "mse"
+    },
+    "vqvae_checkpoint": "models/gz-decals-tiny-v2/checkpoint_latest.pt",
+    "text_vocab_size": 50257,
+    "max_text_tokens": 256,
+    "loss_mask_text": true
+}
