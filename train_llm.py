@@ -67,19 +67,20 @@ def calc_loss_batch(inp, tgt, model, device):
     return nn.functional.cross_entropy(logits.flatten(0, 1), tgt.flatten())
 
 
-def calc_loss_loader(loader, model, device, num_batches=None):
+def calc_loss_loader(loader, model, device, num_batches=None, use_bf16=False):
     if len(loader) == 0:
         return float("nan")
     n = min(num_batches, len(loader)) if num_batches else len(loader)
     total = 0.0
-    for i, (inp, tgt) in enumerate(loader):
-        if i >= n:
-            break
-        total += calc_loss_batch(inp, tgt, model, device).item()
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        for i, (inp, tgt) in enumerate(loader):
+            if i >= n:
+                break
+            total += calc_loss_batch(inp, tgt, model, device).item()
     return total / n
 
 
-def evaluate(model, train_loader, val_loader, device, eval_iter):
+def evaluate(model, train_loader, val_loader, device, eval_iter, use_bf16=False):
     model.eval()
     with torch.no_grad():
         tl = calc_loss_loader(train_loader, model, device, eval_iter)
@@ -97,7 +98,7 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                model_name, save_every_n_epochs, save_every_n_iters=None,
                start_epoch=0, start_global_step=-1, start_tokens_seen=0,
                prev_train_losses=None, prev_val_losses=None,
-               early_stopper=None):
+               early_stopper=None, use_bf16=False):
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
     tokens_seen = start_tokens_seen
@@ -118,7 +119,8 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                 continue
 
             optimizer.zero_grad()
-            loss = calc_loss_batch(inp, tgt, model, device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                loss = calc_loss_batch(inp, tgt, model, device)
             loss.backward()
             optimizer.step()
             tokens_seen += inp.numel()
@@ -132,7 +134,7 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
 
             if global_step % eval_freq == 0:
                 tl, vl = evaluate(model, train_loader, val_loader,
-                                  device, eval_iter)
+                                  device, eval_iter, use_bf16=use_bf16)
                 train_losses.append(tl)
                 val_losses.append(vl)
                 write_status(
@@ -422,7 +424,8 @@ def main():
                start_tokens_seen=start_tokens,
                prev_train_losses=prev_tl,
                prev_val_losses=prev_vl,
-               early_stopper=early_stopper)
+               early_stopper=early_stopper,
+               use_bf16=tp["bf16"])
 
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE training completed in {elapsed:.2f} min")

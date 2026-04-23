@@ -113,31 +113,28 @@ def load_vqvae_checkpoint(model_name, model, optimizer=None, tag="latest"):
 #  Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_vqvae(model, val_loader, device, vqvae_config, num_batches=None):
+def evaluate_vqvae(model, val_loader, device, vqvae_config, num_batches=None, use_bf16=False):
     """Evaluate VQ-VAE on validation set."""
     model.eval()
     total_recon = 0.0
     total_vq = 0.0
     total_usage = 0.0
     n = 0
-
     with torch.no_grad():
-        for i, images in enumerate(val_loader):
-            if num_batches and i >= num_batches:
-                break
-            images = images.to(device)
-            recon, vq_loss, indices = model(images)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            for i, images in enumerate(val_loader):
+                if num_batches and i >= num_batches:
+                    break
+                images = images.to(device)
+                recon, vq_loss, indices = model(images)
 
-            recon_loss = nn.functional.mse_loss(recon, images).item()
-            total_recon += recon_loss
-            total_vq += vq_loss.item()
-            # Compute codebook usage.
-            # HIP/ROCm bug: calling torch.unique() dynamically on GPU tensors throws
-            # 'c10::AcceleratorError: unspecified launch failure'. Force fallback to CPU.
-            unique = indices.cpu().unique().numel()
-            total_usage += unique / vqvae_config.codebook_size
-            n += 1
-
+                recon_loss = nn.functional.mse_loss(recon, images).item()
+                total_recon += recon_loss
+                total_vq += vq_loss.item()
+                # Compute codebook usage.
+                unique = indices.cpu().unique().numel()
+                total_usage += unique / vqvae_config.codebook_size
+                n += 1
     model.train()
     if n == 0:
         return float("nan"), float("nan"), 0.0
@@ -181,7 +178,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                      model_name, save_every_n_epochs, save_every_n_iters=None,
                      start_epoch=0, start_global_step=-1,
                      prev_train_losses=None, prev_val_losses=None,
-                     early_stopper=None):
+                     early_stopper=None, use_bf16=False):
     """Main VQ-VAE training loop."""
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
@@ -199,13 +196,13 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
 
             images = images.to(device)
             optimizer.zero_grad()
-
-            recon, vq_loss, indices = model(images)
-            total_loss, loss_dict = vqvae_loss(
-                recon, images, vq_loss,
-                recon_weight=1.0,
-                commitment_weight=commitment_weight,
-            )
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                recon, vq_loss, indices = model(images)
+                total_loss, loss_dict = vqvae_loss(
+                    recon, images, vq_loss,
+                    recon_weight=1.0,
+                    commitment_weight=commitment_weight,
+                )
 
             total_loss.backward()
             optimizer.step()
@@ -222,7 +219,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
 
             if global_step % eval_freq == 0:
                 recon_l, vq_l, usage = evaluate_vqvae(
-                    model, val_loader, device, vqvae_config, eval_iter
+                    model, val_loader, device, vqvae_config, eval_iter, use_bf16=use_bf16
                 )
                 val_loss = recon_l + vq_l
                 train_losses.append(loss_dict["total_loss"])
@@ -362,6 +359,9 @@ def main():
         prev_tl, prev_vl = [], []
         checkpoint_exists = False
 
+    # ---- Train ----
+    t0 = time.time()
+
     # ---- Merge Parameters ----
     # Resolve final training parameters
     tp = get_train_params("vqvae", train_cfg, args, has_checkpoint=checkpoint_exists)
@@ -418,6 +418,7 @@ def main():
         prev_train_losses=prev_tl,
         prev_val_losses=prev_vl,
         early_stopper=stopper,
+        use_bf16=tp["bf16"],
     )
 
     elapsed = (time.time() - t0) / 60

@@ -72,17 +72,18 @@ def calc_loss_batch_mm(inp, tgt, loss_mask, model, device):
     return masked_cross_entropy(logits, tgt, loss_mask)
 
 
-def evaluate_mm(model, val_loader, device, num_batches=None):
+def evaluate_mm(model, val_loader, device, num_batches=None, use_bf16=False):
     """Evaluate on validation set with masked loss."""
     model.eval()
     total = 0.0
     n = 0
     with torch.no_grad():
-        for i, (inp, tgt, mask) in enumerate(val_loader):
-            if num_batches and i >= num_batches:
-                break
-            total += calc_loss_batch_mm(inp, tgt, mask, model, device).item()
-            n += 1
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            for i, (inp, tgt, mask) in enumerate(val_loader):
+                if num_batches and i >= num_batches:
+                    break
+                total += calc_loss_batch_mm(inp, tgt, mask, model, device).item()
+                n += 1
     model.train()
     return total / n if n > 0 else float("nan")
 
@@ -117,7 +118,7 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                           start_epoch=0, start_global_step=-1,
                           prev_train_losses=None, prev_val_losses=None,
                           frozen_vqvae=None, tokenizer=None,
-                          early_stopper=None):
+                          early_stopper=None, use_bf16=False):
     """Main multi-modal training loop."""
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
@@ -134,7 +135,8 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                 continue
 
             optimizer.zero_grad()
-            loss = calc_loss_batch_mm(inp, tgt, loss_mask, model, device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+                loss = calc_loss_batch_mm(inp, tgt, loss_mask, model, device)
             loss.backward()
             optimizer.step()
             global_step += 1
@@ -147,7 +149,7 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
 
             if global_step % eval_freq == 0:
                 tl = loss.item()
-                vl = evaluate_mm(model, val_loader, device, eval_iter)
+                vl = evaluate_mm(model, val_loader, device, eval_iter, use_bf16=use_bf16)
                 train_losses.append(tl)
                 val_losses.append(vl)
                 write_status(
@@ -412,6 +414,7 @@ def main():
         frozen_vqvae=frozen_vqvae,
         tokenizer=tokenizer,
         early_stopper=early_stopper,
+        use_bf16=tp["bf16"],
     )
 
     elapsed = (time.time() - t0) / 60

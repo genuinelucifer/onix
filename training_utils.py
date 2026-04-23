@@ -142,7 +142,7 @@ def has_checkpoint(model_name, tag="latest"):
 # Cosmetic: safe to change even if resuming from a checkpoint
 _COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
-    "patience", "min_delta", "min_epochs", "window_size",
+    "patience", "min_delta", "min_epochs", "window_size", "bf16",
 ]
 
 # Functional: potentially disruptive to change mid-training if a checkpoint exists
@@ -162,16 +162,17 @@ DEFAULT_CONFIGS = {
     "vqvae": {
         "epochs": 100, "batch_size": 16, "lr": 3e-4,
         "save_every": 10, "save_iters": 0,
-        "eval_freq": 100, "log_freq": 10, "eval_iter": 5,
+        "eval_freq": 100, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
     },
     "multimodal": {
         "epochs": 50, "batch_size": 32, "lr": 4e-4,
         "save_every": 5, "save_iters": 0,
-        "eval_freq": 100, "log_freq": 1, "eval_iter": 5,
+        "eval_freq": 100, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+        "bf16": False,
     }
 }
 
@@ -212,6 +213,8 @@ def add_common_training_args(parser):
                            help="Optimizer to use")
     opt_group.add_argument("--checkpointing", action="store_true",
                            help="Enable gradient checkpointing (saves VRAM)")
+    opt_group.add_argument("--bf16", action="store_true",
+                           help="Use BFloat16 mixed precision training")
 
     # Early stopping
     stop_group = parser.add_argument_group("Early Stopping")
