@@ -143,6 +143,7 @@ def has_checkpoint(model_name, tag="latest"):
 _COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
     "patience", "min_delta", "min_epochs", "window_size", "bf16",
+    "num_workers", "pin_memory", "prefetch_factor",
 ]
 
 # Functional: potentially disruptive to change mid-training if a checkpoint exists
@@ -158,6 +159,8 @@ DEFAULT_CONFIGS = {
         "eval_freq": 50, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+        "bf16": False,
+        "num_workers": 0, "pin_memory": False, "prefetch_factor": 2,
     },
     "vqvae": {
         "epochs": 100, "batch_size": 16, "lr": 3e-4,
@@ -165,6 +168,8 @@ DEFAULT_CONFIGS = {
         "eval_freq": 100, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+        "bf16": False,
+        "num_workers": 4, "pin_memory": True, "prefetch_factor": 2,
     },
     "multimodal": {
         "epochs": 50, "batch_size": 32, "lr": 4e-4,
@@ -173,6 +178,7 @@ DEFAULT_CONFIGS = {
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
         "bf16": False,
+        "num_workers": 0, "pin_memory": False, "prefetch_factor": 2,
     }
 }
 
@@ -226,6 +232,15 @@ def add_common_training_args(parser):
                             help="Minimum full epochs to complete before allow stop")
     stop_group.add_argument("--window-size", type=int, default=None,
                             help="Smoothing window size for validation loss")
+
+    # Data performance
+    data_group = parser.add_argument_group("Data Performance")
+    data_group.add_argument("--num-workers", type=int, default=None,
+                            help="Number of DataLoader workers (0 for main process)")
+    data_group.add_argument("--pin-memory", action="store_true", default=None,
+                            help="Enable pin_memory for faster RAM-to-GPU transfer")
+    data_group.add_argument("--prefetch-factor", type=int, default=None,
+                            help="Number of batches to prefetch per worker")
 
     return parser
 

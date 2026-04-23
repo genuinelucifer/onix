@@ -389,7 +389,9 @@ def main():
         image_size=vqvae_config.image_size,
         image_channels=vqvae_config.image_channels,
         batch_size=tp["batch_size"],
-        num_workers=args.num_workers,
+        num_workers=tp["num_workers"],
+        pin_memory=tp["pin_memory"],
+        prefetch_factor=tp["prefetch_factor"],
     )
     write_status(f"DATA: {data_info}")
     write_status(f"LOADERS train={len(train_loader)} val={len(val_loader)} batches")

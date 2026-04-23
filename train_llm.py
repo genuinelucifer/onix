@@ -380,15 +380,23 @@ def main():
     if data_dir and Path(data_dir).is_dir():
         # Sharded pre-tokenized data
         train_loader, val_loader, data_info = create_pretrain_dataloaders(
-            data_dir, seq_len=context_length, batch_size=batch_size,
+            data_dir, seq_len=tp["context_length"] if "context_length" in tp else context_length, 
+            batch_size=tp["batch_size"],
             max_shards=args.max_shards,
+            num_workers=tp["num_workers"],
+            pin_memory=tp["pin_memory"],
+            prefetch_factor=tp["prefetch_factor"],
         )
         write_status(f"DATA sharded: {data_info}")
     elif data_path:
         # Text file (small dataset)
         train_loader, val_loader, data_info = create_pretrain_dataloaders(
-            data_path, seq_len=context_length, batch_size=batch_size,
+            data_path, seq_len=tp["context_length"] if "context_length" in tp else context_length, 
+            batch_size=tp["batch_size"],
             tokenizer=tokenizer,
+            num_workers=tp["num_workers"],
+            pin_memory=tp["pin_memory"],
+            prefetch_factor=tp["prefetch_factor"],
         )
         write_status(f"DATA text file: {data_info}")
     else:

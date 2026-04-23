@@ -360,6 +360,9 @@ def main():
         data_dir, tokenizer, frozen_vqvae, mm_config,
         batch_size=tp["batch_size"], device=device,
         pre_encoded=pre_encoded,
+        num_workers=tp["num_workers"],
+        pin_memory=tp["pin_memory"],
+        prefetch_factor=tp["prefetch_factor"],
     )
     write_status(f"DATA: {data_info}")
     write_status(f"LOADERS train={len(train_loader)} val={len(val_loader)} batches")
