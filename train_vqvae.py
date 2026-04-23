@@ -43,7 +43,8 @@ from model import (
 from training_utils import (
     create_optimizer, setup_status_file, setup_device,
     migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
-    get_train_params,
+    get_train_params, EarlyStopper,
+    add_common_training_args, get_default_training_config,
 )
 
 
@@ -56,7 +57,7 @@ def save_vqvae_checkpoint(model_name, model, optimizer, epoch, global_step,
     """Save a VQ-VAE checkpoint."""
     import os
     d = get_model_dir(model_name)
-    fname = f"checkpoint_epoch{epoch}.pt" if tag is None else f"checkpoint_{tag}.pt"
+    fname = f"checkpoint_step{global_step}.pt" if tag is None else f"checkpoint_{tag}.pt"
     torch.save({
         "epoch": epoch,
         "global_step": global_step,
@@ -179,11 +180,13 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                      vqvae_config, num_epochs, log_freq, eval_freq, eval_iter,
                      model_name, save_every_n_epochs, save_every_n_iters=None,
                      start_epoch=0, start_global_step=-1,
-                     prev_train_losses=None, prev_val_losses=None):
+                     prev_train_losses=None, prev_val_losses=None,
+                     early_stopper=None):
     """Main VQ-VAE training loop."""
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
     global_step = start_global_step
+    completed_epochs = start_epoch
 
     commitment_weight = vqvae_config.commitment_weight
 
@@ -221,8 +224,9 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                 recon_l, vq_l, usage = evaluate_vqvae(
                     model, val_loader, device, vqvae_config, eval_iter
                 )
+                val_loss = recon_l + vq_l
                 train_losses.append(loss_dict["total_loss"])
-                val_losses.append(recon_l + vq_l)
+                val_losses.append(val_loss)
                 write_status(
                     f"EVAL epoch={epoch+1}/{num_epochs} step={global_step:06d} "
                     f"val_loss={recon_l + vq_l:.4f} val_recon={recon_l:.4f} val_vq={vq_l:.4f} "
@@ -231,12 +235,31 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                 # Save visual samples
                 save_reconstruction_samples(model, val_loader, device, model_name, global_step)
 
+                # Early stopping check
+                if early_stopper is not None:
+                    if early_stopper.check(val_loss, global_step, completed_epochs):
+                        write_status(
+                            f"EARLY_STOP triggered at step {global_step} "
+                            f"({early_stopper.status_message()})"
+                        )
+                        ckpt_path = save_vqvae_checkpoint(
+                            model_name, model, optimizer, epoch + 1, global_step,
+                            train_losses, val_losses, tag="early_stop")
+                        save_vqvae_checkpoint(
+                            model_name, model, optimizer, epoch + 1, global_step,
+                            train_losses, val_losses)
+                        write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
+                        return train_losses, val_losses
+
             if save_every_n_iters and save_every_n_iters > 0 and global_step > 0:
                 if global_step % save_every_n_iters == 0:
                     ckpt_path = save_vqvae_checkpoint(
                         model_name, model, optimizer, epoch, global_step,
                         train_losses, val_losses, tag=f"step{global_step}")
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
+
+        # Epoch completed
+        completed_epochs = epoch + 1
 
         # Epoch checkpoint
         if (epoch + 1) % save_every_n_epochs == 0:
@@ -265,45 +288,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="YALLM VQ-VAE Pretraining (Phase 1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Train VQ-VAE
-  python train_vqvae.py --model-name my-vqvae --config configs/vqvae_default.json \\
-      --data-dir /path/to/images/ --epochs 100 --batch-size 16
-
-  # Resume
-  python train_vqvae.py --model-name my-vqvae --resume --epochs 200
-""",
     )
+    # Common training args
+    add_common_training_args(parser)
 
-    parser.add_argument("--model-name", required=True,
-                        help="Name for this model (creates models/<name>/)")
-    parser.add_argument("--config", default=None,
-                        help="Path to VQ-VAE config JSON")
-    parser.add_argument("--data-dir", type=str, default=None,
+    # VQ-VAE specific args
+    vq_group = parser.add_argument_group("VQ-VAE Specific")
+    vq_group.add_argument("--data-dir", type=str, default=None,
                         help="Path to directory containing training images")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from latest checkpoint")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--save-every", type=int, default=10,
-                        help="Save checkpoint every N epochs")
-    parser.add_argument("--save-iters", type=int, default=0,
-                        help="Save checkpoint every N iterations (0=disabled)")
-    parser.add_argument("--eval-freq", type=int, default=100,
-                        help="Evaluate every N steps")
-    parser.add_argument("--log-freq", type=int, default=10,
-                        help="Log every N steps")
-    parser.add_argument("--eval-iter", type=int, default=5,
-                        help="Batches per evaluation")
-    parser.add_argument("--num-workers", type=int, default=4,
+    vq_group.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader workers")
-    parser.add_argument("--optimizer", default="adamw",
-                        choices=["adamw", "adamw8bit"],
-                        help="Optimizer (default: adamw)")
-    parser.add_argument("--checkpointing", action="store_true",
-                        help="Enable gradient checkpointing")
 
     args = parser.parse_args()
 
@@ -314,51 +308,27 @@ Examples:
 
     if args.resume:
         checkpoint_exists = has_checkpoint(args.model_name)
-
         if checkpoint_exists:
             write_status("RESUME loading config and checkpoint...")
             full_cfg = load_model_config(args.model_name)
-            has_ckpt = True
         else:
             full_cfg = handle_resume_no_checkpoint(args.model_name)
-            has_ckpt = False
 
         train_cfg = full_cfg["training"]
         vqvae_config = VQVAEConfig.from_dict(full_cfg["vqvae"])
-
-        # Override checkpointing if requested
         if args.checkpointing:
             vqvae_config.grad_checkpointing = True
 
-        total_epochs = args.epochs if args.epochs != 100 else train_cfg["epochs"]
         data_dir = train_cfg["data_dir"]
-
         model = VQVAE(vqvae_config).to(device)
-        opt_name = train_cfg.get("optimizer", "adamw")
-        optimizer = create_optimizer(model, opt_name, train_cfg["lr"],
-                                     weight_decay=0.01)
 
-        if checkpoint_exists:
-            ckpt_meta = load_vqvae_checkpoint(args.model_name, model, optimizer)
-            model.to(device)
-            migrate_optimizer_to_device(optimizer, device)
+        if not checkpoint_exists:
+            opt_name = train_cfg.get("optimizer", "adamw")
+            optimizer = create_optimizer(model, opt_name, train_cfg["lr"],
+                                         weight_decay=0.01)
 
-            start_epoch = ckpt_meta["epoch"]
-            start_step = ckpt_meta["global_step"]
-            prev_tl = ckpt_meta["train_losses"]
-            prev_vl = ckpt_meta["val_losses"]
-        else:
-            start_epoch, start_step = 0, -1
-            prev_tl, prev_vl = [], []
-
-        batch_size = train_cfg["batch_size"]
-
-        if start_epoch >= total_epochs:
-            write_status(f"Already trained {start_epoch} epochs (target={total_epochs}).")
-            return
-
-        write_status(f"RESUMED from epoch={start_epoch+1} step={start_step}")
-
+        start_epoch, start_step = 0, -1
+        prev_tl, prev_vl = [], []
     else:
         if not args.config:
             parser.error("--config is required for new VQ-VAE training")
@@ -371,22 +341,12 @@ Examples:
         write_status(f"CONFIG loaded from {args.config}")
 
         model = VQVAE(vqvae_config).to(device)
-        has_ckpt = False
         write_status(f"MODEL created:\n{model.summary()}")
 
-        # Save config
-        train_cfg = {
-            "data_dir": args.data_dir,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "save_every": args.save_every,
-            "save_iters": args.save_iters,
-            "log_freq": args.log_freq,
-            "eval_freq": args.eval_freq,
-            "eval_iter": args.eval_iter,
-            "optimizer": args.optimizer,
-        }
+        # Set initial training config with defaults
+        train_cfg = get_default_training_config("vqvae", args)
+        train_cfg["data_dir"] = args.data_dir
+
         full_cfg = {
             "model_type": "vqvae",
             "vqvae": vqvae_config.to_dict(),
@@ -395,37 +355,60 @@ Examples:
         save_model_config(args.model_name, full_cfg)
         write_status(f"CONFIG saved to models/{args.model_name}/config.json")
 
-        total_epochs = args.epochs
         data_dir = args.data_dir
-        batch_size = args.batch_size
-
-        optimizer = create_optimizer(model, args.optimizer, args.lr,
+        optimizer = create_optimizer(model, train_cfg["optimizer"], train_cfg["lr"],
                                      weight_decay=0.01)
         start_epoch, start_step = 0, -1
         prev_tl, prev_vl = [], []
+        checkpoint_exists = False
+
+    # ---- Merge Parameters ----
+    # Resolve final training parameters
+    tp = get_train_params("vqvae", train_cfg, args, has_checkpoint=checkpoint_exists)
+
+    # ---- Resume Checkpoint Load ----
+    if args.resume and checkpoint_exists:
+        optimizer = create_optimizer(model, tp["optimizer"], tp["lr"], weight_decay=0.01)
+        ckpt_meta = load_vqvae_checkpoint(args.model_name, model, optimizer)
+        model.to(device)
+        migrate_optimizer_to_device(optimizer, device)
+
+        start_epoch = ckpt_meta["epoch"]
+        start_step = ckpt_meta["global_step"]
+        prev_tl = ckpt_meta["train_losses"]
+        prev_vl = ckpt_meta["val_losses"]
+
+        if start_epoch >= tp["epochs"]:
+            write_status(f"Already trained {start_epoch} epochs (target={tp['epochs']}).")
+            return
+        write_status(f"RESUMED from epoch={start_epoch+1} step={start_step} -> training to epoch {tp['epochs']}")
 
     # Load data
     train_loader, val_loader, data_info = create_image_dataloaders(
         data_dir,
         image_size=vqvae_config.image_size,
         image_channels=vqvae_config.image_channels,
-        batch_size=batch_size,
+        batch_size=tp["batch_size"],
         num_workers=args.num_workers,
     )
     write_status(f"DATA: {data_info}")
     write_status(f"LOADERS train={len(train_loader)} val={len(val_loader)} batches")
     write_status(f"MODEL params={model.param_count():,}")
 
-    # Train
-    t0 = time.time()
-    tp = get_train_params(train_cfg, args, has_checkpoint=has_ckpt)
+    # Early stopping
+    stopper = EarlyStopper(
+        patience_evals=tp["patience"],
+        min_delta=tp["min_delta"],
+        min_epochs=tp["min_epochs"],
+        window_size=tp["window_size"]
+    )
 
     # Initial sample
     save_reconstruction_samples(model, val_loader, device, args.model_name, max(0, start_step))
 
     train_vqvae_loop(
         model, train_loader, val_loader, optimizer, device,
-        vqvae_config, total_epochs,
+        vqvae_config, tp["epochs"],
         log_freq=tp["log_freq"], eval_freq=tp["eval_freq"], eval_iter=tp["eval_iter"],
         model_name=args.model_name,
         save_every_n_epochs=tp["save_every"],
@@ -434,6 +417,7 @@ Examples:
         start_global_step=start_step,
         prev_train_losses=prev_tl,
         prev_val_losses=prev_vl,
+        early_stopper=stopper,
     )
 
     elapsed = (time.time() - t0) / 60

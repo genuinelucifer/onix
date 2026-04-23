@@ -56,6 +56,7 @@ from training_utils import (
     create_optimizer, setup_status_file, setup_device,
     migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
     get_train_params, EarlyStopper,
+    add_common_training_args, get_default_training_config,
 )
 
 
@@ -237,50 +238,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="YALLM Multi-Modal LLM Training (Phase 2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Online encoding (slower, simpler)
-  python train_multimodal.py --model-name my-imggen \\
-      --config configs/multimodal_pixelart.json \\
-      --data-dir /path/to/image_text_pairs/ --epochs 50
-
-  # Pre-encoded data (faster, requires encode_dataset.py step first)
-  python train_multimodal.py --model-name my-imggen \\
-      --config configs/multimodal_pixelart.json \\
-      --data-dir pretrain_data/encoded_pixelart/ --pre-encoded --epochs 50
-
-  # Resume
-  python train_multimodal.py --model-name my-imggen --resume
-""",
     )
+    # Common training args
+    add_common_training_args(parser)
 
-    parser.add_argument("--model-name", required=True)
-    parser.add_argument("--config", default=None,
-                        help="Path to MultiModalConfig JSON")
-    parser.add_argument("--data-dir", type=str, default=None,
+    # Multi-modal specific args
+    mm_group = parser.add_argument_group("Multi-modal Specific")
+    mm_group.add_argument("--data-dir", type=str, default=None,
                         help="Path to image+text pairs or pre-encoded shards")
-    parser.add_argument("--pre-encoded", action="store_true",
+    mm_group.add_argument("--pre-encoded", action="store_true",
                         help="Data is pre-encoded (from encode_dataset.py)")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=4e-4)
-    parser.add_argument("--save-every", type=int, default=5)
-    parser.add_argument("--save-iters", type=int, default=0)
-    parser.add_argument("--eval-freq", type=int, default=50)
-    parser.add_argument("--log-freq", type=int, default=5)
-    parser.add_argument("--eval-iter", type=int, default=5)
-    parser.add_argument("--optimizer", default="adamw",
-                        choices=["adamw", "adamw8bit"])
-    parser.add_argument("--checkpointing", action="store_true",
-                        help="Enable gradient checkpointing")
-    parser.add_argument("--no-sdpa", action="store_false", dest="use_sdpa")
-    parser.set_defaults(use_sdpa=True)
-
-    # Early stopping
-    parser.add_argument("--patience-evals", type=int, default=6,
-                        help="Stop after N consecutive evals with no improvement "
-                             "(0 to disable). Only active after first full epoch.")
+    mm_group.add_argument("--use-sdpa", action="store_true", default=True,
+                        help="Use Scaled Dot Product Attention (default: True)")
+    mm_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
+                        help="Disable SDPA")
 
     args = parser.parse_args()
 
@@ -303,7 +274,6 @@ Examples:
         train_cfg = full_cfg["training"]
         mm_config = MultiModalConfig.from_dict(full_cfg["multimodal"])
 
-        total_epochs = args.epochs if args.epochs != 50 else train_cfg["epochs"]
         data_dir = train_cfg.get("data_dir")
         pre_encoded = train_cfg.get("pre_encoded", False)
 
@@ -311,30 +281,21 @@ Examples:
         transformer_config = mm_config.build_transformer_config()
         model = CausalLM(transformer_config).to(device)
 
-        opt_name = train_cfg.get("optimizer", "adamw")
-        optimizer = create_optimizer(model, opt_name, train_cfg["lr"])
+        if checkpoint_exists:
+            # We don't create optimizer here yet; get_train_params will tell us which one
+            pass
+        else:
+            # For resume-no-checkpoint, we'll need an optimizer
+            opt_name = train_cfg.get("optimizer", "adamw")
+            optimizer = create_optimizer(model, opt_name, train_cfg["lr"])
 
         if checkpoint_exists:
-            ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
-            model.to(device)
-            migrate_optimizer_to_device(optimizer, device)
-
-            start_epoch = ckpt_meta["epoch"]
-            start_step = ckpt_meta["global_step"]
-            prev_tl = ckpt_meta["train_losses"]
-            prev_vl = ckpt_meta["val_losses"]
+            # We'll load the checkpoint AFTER merging params
+            start_epoch, start_step = 0, -1
+            prev_tl, prev_vl = [], []
         else:
             start_epoch, start_step = 0, -1
             prev_tl, prev_vl = [], []
-
-        batch_size = train_cfg["batch_size"]
-
-        if start_epoch >= total_epochs:
-            write_status(f"Already trained {start_epoch} epochs (target={total_epochs}).")
-            return
-
-        write_status(f"RESUMED from epoch={start_epoch+1} step={start_step}")
-
     else:
         if not args.config:
             parser.error("--config is required for new multi-modal training")
@@ -355,20 +316,11 @@ Examples:
         write_status(f"MODEL created:\n{model.summary()}")
         write_status(f"\n{mm_config.summary()}")
 
-        # Save config
-        train_cfg = {
-            "data_dir": args.data_dir,
-            "pre_encoded": args.pre_encoded,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "save_every": args.save_every,
-            "save_iters": args.save_iters,
-            "log_freq": args.log_freq,
-            "eval_freq": args.eval_freq,
-            "eval_iter": args.eval_iter,
-            "optimizer": args.optimizer,
-        }
+        # Set initial training config with defaults
+        train_cfg = get_default_training_config("multimodal", args)
+        train_cfg["data_dir"] = args.data_dir
+        train_cfg["pre_encoded"] = args.pre_encoded
+
         full_cfg = {
             "model_type": "multimodal",
             "multimodal": mm_config.to_dict(),
@@ -377,14 +329,13 @@ Examples:
         }
         save_model_config(args.model_name, full_cfg)
 
-        total_epochs = args.epochs
         data_dir = args.data_dir
         pre_encoded = args.pre_encoded
-        batch_size = args.batch_size
 
-        optimizer = create_optimizer(model, args.optimizer, args.lr)
+        optimizer = create_optimizer(model, train_cfg["optimizer"], train_cfg["lr"])
         start_epoch, start_step = 0, -1
         prev_tl, prev_vl = [], []
+        checkpoint_exists = False
 
     # Load frozen VQ-VAE
     frozen_vqvae = None
@@ -398,10 +349,14 @@ Examples:
             f"Image sampling during training will be disabled."
         )
 
+    # ---- Merge parameters ----
+    # Resolve final training parameters
+    tp = get_train_params("multimodal", train_cfg, args, has_checkpoint=checkpoint_exists)
+
     # Load data
     train_loader, val_loader, data_info = create_multimodal_dataloaders(
         data_dir, tokenizer, frozen_vqvae, mm_config,
-        batch_size=batch_size, device=device,
+        batch_size=tp["batch_size"], device=device,
         pre_encoded=pre_encoded,
     )
     write_status(f"DATA: {data_info}")
@@ -410,22 +365,42 @@ Examples:
     n_params = sum(p.numel() for p in model.parameters())
     write_status(f"MODEL params={n_params:,}")
 
+    # ---- Train ----
+    t0 = time.time()
+
+    if args.resume and checkpoint_exists:
+        # Now that we have merged params, we can create optimizer and load checkpoint
+        optimizer = create_optimizer(model, tp["optimizer"], tp["lr"])
+        ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
+        model.to(device)
+        migrate_optimizer_to_device(optimizer, device)
+
+        start_epoch = ckpt_meta["epoch"]
+        start_step = ckpt_meta["global_step"]
+        prev_tl = ckpt_meta["train_losses"]
+        prev_vl = ckpt_meta["val_losses"]
+
+        if start_epoch >= tp["epochs"]:
+            write_status(f"Already trained {start_epoch} epochs (target={tp['epochs']}).")
+            return
+        write_status(f"RESUMED from epoch={start_epoch+1} step={start_step} -> training to epoch {tp['epochs']}")
+
     # ---- Early stopper ----
     early_stopper = None
-    if args.patience_evals > 0:
+    if tp["patience"] > 0:
         early_stopper = EarlyStopper(
-            patience_evals=args.patience_evals,
-            min_epochs=1,
+            patience_evals=tp["patience"],
+            min_delta=tp["min_delta"],
+            min_epochs=tp["min_epochs"],
+            window_size=tp["window_size"],
         )
-        write_status(f"EARLY_STOP enabled: patience={args.patience_evals} evals, min_epochs=1")
-
-    # Train
-    t0 = time.time()
-    tp = get_train_params(train_cfg, args)
+        write_status(f"EARLY_STOP enabled: patience={tp['patience']} evals, "
+                     f"min_delta={tp['min_delta']}, min_epochs={tp['min_epochs']}, "
+                     f"window={tp['window_size']}")
 
     train_multimodal_loop(
         model, train_loader, val_loader, optimizer, device,
-        mm_config, total_epochs,
+        mm_config, tp["epochs"],
         log_freq=tp["log_freq"], eval_freq=tp["eval_freq"], eval_iter=tp["eval_iter"],
         model_name=args.model_name,
         save_every_n_epochs=tp["save_every"],

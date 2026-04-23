@@ -51,7 +51,7 @@ def save_checkpoint(model_name, model, optimizer, epoch, global_step,
                     tokens_seen, train_losses, val_losses, tag=None):
     """Save a training checkpoint to models/<model_name>/."""
     d = get_model_dir(model_name)
-    fname = f"checkpoint_epoch{epoch}.pt" if tag is None else f"checkpoint_{tag}.pt"
+    fname = f"checkpoint_step{global_step}.pt" if tag is None else f"checkpoint_{tag}.pt"
     torch.save({
         "epoch": epoch,
         "global_step": global_step,

@@ -142,15 +142,110 @@ def has_checkpoint(model_name, tag="latest"):
 # Cosmetic: safe to change even if resuming from a checkpoint
 _COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
+    "patience", "min_delta", "min_epochs", "window_size",
 ]
 
 # Functional: potentially disruptive to change mid-training if a checkpoint exists
 _FUNCTIONAL_PARAMS = [
-    "batch_size", "lr", "optimizer"
+    "batch_size", "lr", "optimizer", "epochs"
 ]
 
+# Mode-specific defaults
+DEFAULT_CONFIGS = {
+    "llm": {
+        "epochs": 10, "batch_size": 8, "lr": 4e-4,
+        "save_every": 5, "save_iters": 0,
+        "eval_freq": 50, "log_freq": 5, "eval_iter": 5,
+        "optimizer": "adamw",
+        "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+    },
+    "vqvae": {
+        "epochs": 100, "batch_size": 16, "lr": 3e-4,
+        "save_every": 10, "save_iters": 0,
+        "eval_freq": 100, "log_freq": 10, "eval_iter": 5,
+        "optimizer": "adamw",
+        "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+    },
+    "multimodal": {
+        "epochs": 50, "batch_size": 32, "lr": 4e-4,
+        "save_every": 5, "save_iters": 0,
+        "eval_freq": 100, "log_freq": 1, "eval_iter": 5,
+        "optimizer": "adamw",
+        "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+    }
+}
 
-def get_train_params(train_cfg, args, has_checkpoint: bool = False):
+
+def add_common_training_args(parser):
+    """Add standardized training arguments and early stopping params to a parser."""
+    # Identification
+    parser.add_argument("--model-name", required=True,
+                        help="Name for this model (creates models/<name>/)")
+    parser.add_argument("--config", default=None,
+                        help="Path to model architecture config JSON")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint")
+
+    # Hyperparameters (all default to None to honor config.json on resume)
+    train_group = parser.add_argument_group("Training Hyperparameters")
+    train_group.add_argument("--epochs", type=int, default=None)
+    train_group.add_argument("--batch-size", type=int, default=None)
+    train_group.add_argument("--lr", type=float, default=None)
+
+    # Checkpointing & Logging
+    log_group = parser.add_argument_group("Logging & Checkpointing")
+    log_group.add_argument("--save-every", type=int, default=None,
+                           help="Save checkpoint every N epochs")
+    log_group.add_argument("--save-iters", type=int, default=None,
+                           help="Save checkpoint every N iterations (0 to disable)")
+    log_group.add_argument("--eval-freq", type=int, default=None,
+                           help="Evaluate every N steps")
+    log_group.add_argument("--log-freq", type=int, default=None,
+                           help="Log status message every N steps")
+    log_group.add_argument("--eval-iter", type=int, default=None,
+                           help="Number of batches per evaluation")
+
+    # Optimization
+    opt_group = parser.add_argument_group("Optimization & Memory")
+    opt_group.add_argument("--optimizer", default=None,
+                           choices=["adamw", "sgd", "adamw8bit", "sgd8bit"],
+                           help="Optimizer to use")
+    opt_group.add_argument("--checkpointing", action="store_true",
+                           help="Enable gradient checkpointing (saves VRAM)")
+
+    # Early stopping
+    stop_group = parser.add_argument_group("Early Stopping")
+    stop_group.add_argument("--patience", type=int, default=None,
+                            help="Stop after N consecutive evals with no improvement (0 to disable)")
+    stop_group.add_argument("--min-delta", type=float, default=None,
+                            help="Minimum relative improvement in loss")
+    stop_group.add_argument("--min-epochs", type=int, default=None,
+                            help="Minimum full epochs to complete before allow stop")
+    stop_group.add_argument("--window-size", type=int, default=None,
+                            help="Smoothing window size for validation loss")
+
+    return parser
+
+
+def get_default_training_config(mode, args=None):
+    """
+    Return a training config dict for a new run, using mode defaults
+    and optional command-line overrides.
+    """
+    if mode not in DEFAULT_CONFIGS:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    cfg = DEFAULT_CONFIGS[mode].copy()
+    if args:
+        # Override with any non-None arguments
+        for key in cfg.keys():
+            val = getattr(args, key, None)
+            if val is not None:
+                cfg[key] = val
+    return cfg
+
+
+def get_train_params(mode, train_cfg, args, has_checkpoint: bool = False):
     """Extract training hyperparams from CLI and saved config.
 
     Rules for overrides:
@@ -160,9 +255,10 @@ def get_train_params(train_cfg, args, has_checkpoint: bool = False):
 
     Returns a dict with all parameters populated.
     """
-    result = {}
+    # 1. Start with mode defaults
+    result = DEFAULT_CONFIGS[mode].copy()
 
-    # 1. Start with everything from the saved config
+    # 2. Update with everything from the saved config
     result.update(train_cfg)
 
     # 2. Check for CLI overrides
@@ -189,51 +285,60 @@ def get_train_params(train_cfg, args, has_checkpoint: bool = False):
 #  Early stopping
 # ---------------------------------------------------------------------------
 
+from collections import deque
+
 class EarlyStopper:
-    """Tracks eval-loss trend and triggers early stopping.
+    """Tracks eval-loss trend and triggers early stopping with noise smoothing.
 
     Parameters
     ----------
     patience_evals : int
-        Number of consecutive evaluation points with no improvement before
-        stopping.  (Not raw training steps — evaluation points.)
+        Number of consecutive evaluation points with no improvement before stopping.
     min_delta : float
-        Minimum improvement in loss to count as progress.
+        Minimum relative improvement in loss (e.g., 0.001 = 0.1% improvement).
     min_epochs : int
-        Don't stop before this many *full* epochs have completed (i.e. all
-        data has been seen at least this many times).
+        Don't stop before this many *full* epochs have completed.
+    window_size : int
+        Smoothing window size for validation loss.
     """
 
-    def __init__(self, patience_evals=6, min_delta=1e-4, min_epochs=1):
+    def __init__(self, patience_evals=6, min_delta=1e-4, min_epochs=2, window_size=3):
         self.patience_evals = patience_evals
         self.min_delta = min_delta
         self.min_epochs = min_epochs
+        self.window_size = window_size
 
         self.best_loss = float("inf")
         self.best_step = -1
         self.evals_since_best = 0
+        self.history = deque(maxlen=window_size)
 
     def check(self, loss, global_step, completed_epochs):
-        """Return True if training should stop.
+        """Return True if training should stop. Uses moving average of recent losses."""
+        self.history.append(loss)
+        
+        # Don't check until window is full
+        if len(self.history) < self.window_size:
+            return False
 
-        Parameters
-        ----------
-        loss : float
-            Current evaluation loss.
-        global_step : int
-            Current training step (for logging only).
-        completed_epochs : int
-            Number of *full* epochs completed so far (0-indexed epoch that just
-            finished, +1).  E.g., after epoch 0 ends, pass 1.
-        """
-        if loss < self.best_loss - self.min_delta:
-            self.best_loss = loss
+        # Calculate smoothed loss
+        smoothed_loss = sum(self.history) / len(self.history)
+
+        # Relative improvement check: smoothed_loss must be < best_loss * (1 - delta)
+        # Handle first valid window
+        if self.best_loss == float("inf"):
+            self.best_loss = smoothed_loss
+            self.best_step = global_step
+            return False
+
+        if smoothed_loss < self.best_loss * (1.0 - self.min_delta):
+            self.best_loss = smoothed_loss
             self.best_step = global_step
             self.evals_since_best = 0
         else:
             self.evals_since_best += 1
 
-        # Don't stop before min_epochs full epochs have completed
+        # Logic for stopping
         if completed_epochs < self.min_epochs:
             return False
 
@@ -241,7 +346,8 @@ class EarlyStopper:
 
     def status_message(self):
         """Human-readable status string for logging."""
+        avg_loss = sum(self.history) / len(self.history) if self.history else 0.0
         return (
-            f"best_loss={self.best_loss:.4f} at step {self.best_step}, "
+            f"smoothed_loss={avg_loss:.4f}, best_loss={self.best_loss:.4f} at step {self.best_step}, "
             f"evals_since_best={self.evals_since_best}/{self.patience_evals}"
         )

@@ -50,6 +50,7 @@ from training_utils import (
     create_optimizer, setup_status_file, setup_device,
     migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
     get_train_params, EarlyStopper,
+    add_common_training_args, get_default_training_config,
 )
 
 # Data pipeline
@@ -218,74 +219,32 @@ def main():
     parser = argparse.ArgumentParser(
         description="YALLM Pretrain",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # New architecture presets
-  python train.py --mode llm --model-name my-llama --preset llama-1b --data ../the-verdict.txt
-  python train.py --mode llm --model-name my-llama --preset llama-1b --data-dir pretrain_data/fineweb_edu_10bt/
-
-  # Custom config file
-  python train.py --mode llm --model-name my-custom --config my_config.json --data ../the-verdict.txt
-
-  # Resume any model
-  python train.py --model-name my-llama --resume
-""",
     )
-    # Model specification
-    model_group = parser.add_argument_group("Model specification")
-    model_group.add_argument("--preset", default=None,
+    # Common training args (model-name, config, resume, epochs, lr, etc.)
+    add_common_training_args(parser)
+
+    # LLM-specific data source args
+    data_group = parser.add_argument_group("LLM Data Source")
+    data_group.add_argument("--data", type=str, default=None,
+                            help="Path to training text file (small datasets)")
+    data_group.add_argument("--data-dir", type=str, default=None,
+                            help="Path to pre-tokenized shard directory (large datasets)")
+    data_group.add_argument("--max-shards", type=int, default=None,
+                            help="Limit number of data shards (for testing)")
+
+    # LLM-specific architecture selection
+    arch_group = parser.add_argument_group("LLM Architecture Selection")
+    arch_group.add_argument("--preset", default=None,
                              choices=list(PRESETS.keys()),
                              help="Use a preset architecture (e.g. llama-1b, gpt2-124m)")
-    model_group.add_argument("--config", default=None,
-                             help="Path to custom model config JSON")
-    model_group.add_argument("--model-size", default=None,
+    arch_group.add_argument("--model-size", default=None,
                              help="Legacy compatibility mapping (e.g. 124M -> gpt2-124m)")
-
-    # Common args
-    parser.add_argument("--model-name", required=True,
-                        help="Name for this model (creates models/<name>/)")
-    parser.add_argument("--data", type=str, default=None,
-                        help="Path to training text file")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="Path to pre-tokenized shard directory")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume training from latest checkpoint")
-    parser.add_argument("--context-length", type=int, default=None,
-                        help="Override context length (default: from preset/config)")
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Total epochs (not additional)")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=4e-4)
-    parser.add_argument("--save-every", type=int, default=5,
-                        help="Save checkpoint every N epochs")
-    parser.add_argument("--save-iters", type=int, default=0,
-                        help="Save checkpoint every N iterations (0 to disable)")
-    parser.add_argument("--eval-freq", type=int, default=50,
-                        help="Evaluate (train/val loss over multiple batches) every N steps")
-    parser.add_argument("--log-freq", type=int, default=5,
-                        help="Log current batch loss to status.txt every N steps")
-    parser.add_argument("--eval-iter", type=int, default=5,
-                        help="Number of batches per evaluation")
-    parser.add_argument("--drop-rate", type=float, default=0.1,
-                        help="Dropout rate (legacy mode)")
-    parser.add_argument("--max-shards", type=int, default=None,
-                        help="Limit number of data shards (for testing)")
-
-    # Early stopping
-    parser.add_argument("--patience-evals", type=int, default=6,
-                        help="Stop after N consecutive evals with no improvement "
-                             "(0 to disable). Only active after first full epoch.")
-
-    # Optimization args
-    opt_group = parser.add_argument_group("Optimization & Memory")
-    opt_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
-                           help="Disable SDPA (Flash/Mem-Eff Attention)")
-    opt_group.add_argument("--checkpointing", action="store_true",
-                           help="Enable gradient checkpointing (saves VRAM, slower training)")
-    opt_group.add_argument("--optimizer", default="adamw",
-                           choices=["adamw", "sgd", "adamw8bit", "sgd8bit"],
-                           help="Optimizer to use (default: adamw)")
-    opt_group.set_defaults(use_sdpa=True)
+    arch_group.add_argument("--context-length", type=int, default=None,
+                            help="Override context length (default: from preset/config)")
+    arch_group.add_argument("--use-sdpa", action="store_true", default=True,
+                            help="Use Scaled Dot Product Attention (default: True)")
+    arch_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
+                            help="Disable SDPA")
 
     args = parser.parse_args()
 
@@ -309,7 +268,6 @@ Examples:
 
         train_cfg = full_cfg["training"]
 
-        total_epochs = args.epochs if args.epochs != 10 else train_cfg["epochs"]
         data_path = train_cfg.get("data")
         data_dir = train_cfg.get("data_dir")
 
@@ -325,35 +283,15 @@ Examples:
                 "Please use a previous version of YALLM or convert the state_dict."
             )
 
-        opt_name = train_cfg.get("optimizer", "adamw")
-        optimizer = create_optimizer(model, opt_name, lr=train_cfg["lr"])
+        if not checkpoint_exists:
+            opt_name = train_cfg.get("optimizer", "adamw")
+            optimizer = create_optimizer(model, opt_name, lr=train_cfg["lr"])
 
-        if checkpoint_exists:
-            ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
-            model.to(device)
-            migrate_optimizer_to_device(optimizer, device)
-
-            start_epoch = ckpt_meta["epoch"]
-            start_step = ckpt_meta["global_step"]
-            start_tokens = ckpt_meta["tokens_seen"]
-            prev_tl = ckpt_meta["train_losses"]
-            prev_vl = ckpt_meta["val_losses"]
-        else:
-            # Fresh start with existing config
-            start_epoch, start_step, start_tokens = 0, -1, 0
-            prev_tl, prev_vl = [], []
-
-        if start_epoch >= total_epochs:
-            write_status(f"Already trained {start_epoch} epochs (target={total_epochs}). "
-                         f"Increase --epochs to continue.")
-            return
-
-        write_status(f"RESUMED from epoch={start_epoch + 1} step={start_step} "
-                     f"tokens={start_tokens} -> training to epoch {total_epochs}")
+        start_epoch, start_step, start_tokens = 0, -1, 0
+        prev_tl, prev_vl = [], []
 
         # Get context length for data loading
         context_length = model.config.context_length
-        batch_size = train_cfg["batch_size"]
 
     else:
         # ---- New run ----
@@ -389,20 +327,11 @@ Examples:
         model = create_model_from_config(model_config, device)
         context_length = model_config.context_length
 
-        # Save config
-        train_cfg = {
-            "data": args.data,
-            "data_dir": args.data_dir,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "save_every": args.save_every,
-            "save_iters": args.save_iters,
-            "log_freq": args.log_freq,
-            "eval_freq": args.eval_freq,
-            "eval_iter": args.eval_iter,
-            "optimizer": args.optimizer,
-        }
+        # Set initial training config with defaults
+        train_cfg = get_default_training_config("llm", args)
+        train_cfg["data"] = args.data
+        train_cfg["data_dir"] = args.data_dir
+
         full_cfg = {
             "architecture": model_config.to_dict(),
             "training": train_cfg,
@@ -411,16 +340,41 @@ Examples:
         save_model_config(args.model_name, full_cfg)
         write_status(f"CONFIG saved to models/{args.model_name}/config.json")
 
-        total_epochs = args.epochs
         data_path = args.data
         data_dir = args.data_dir
-        batch_size = args.batch_size
 
-        optimizer = create_optimizer(model, args.optimizer, lr=args.lr)
+        optimizer = create_optimizer(model, train_cfg["optimizer"], lr=train_cfg["lr"])
         start_epoch, start_step, start_tokens = 0, -1, 0
         prev_tl, prev_vl = [], []
+        checkpoint_exists = False
 
-    # ---- Load data ----
+    # ---- Train ----
+    t0 = time.time()
+    # Resolve final training parameters
+    tp = get_train_params("llm", train_cfg, args, has_checkpoint=checkpoint_exists)
+
+    if args.resume and checkpoint_exists:
+        optimizer = create_optimizer(model, tp["optimizer"], lr=tp["lr"])
+        ckpt_meta = load_checkpoint(args.model_name, model, optimizer)
+        model.to(device)
+        migrate_optimizer_to_device(optimizer, device)
+
+        start_epoch = ckpt_meta["epoch"]
+        start_step = ckpt_meta["global_step"]
+        start_tokens = ckpt_meta["tokens_seen"]
+        prev_tl = ckpt_meta["train_losses"]
+        prev_vl = ckpt_meta["val_losses"]
+
+        if start_epoch >= tp["epochs"]:
+            write_status(f"Already trained {start_epoch} epochs (target={tp['epochs']}). "
+                         f"Increase --epochs to continue.")
+            return
+
+        write_status(f"RESUMED from epoch={start_epoch + 1} step={start_step} "
+                     f"tokens={start_tokens} -> training to epoch {tp['epochs']}")
+
+    # ---- Setup Data Loader ----
+    batch_size = tp["batch_size"]
     if data_dir and Path(data_dir).is_dir():
         # Sharded pre-tokenized data
         train_loader, val_loader, data_info = create_pretrain_dataloaders(
@@ -440,24 +394,21 @@ Examples:
 
     write_status(f"LOADERS train={len(train_loader)} val={len(val_loader)} batches")
 
-    n_params = sum(p.numel() for p in model.parameters())
-    write_status(f"MODEL params={n_params:,}")
-
     # ---- Early stopper ----
     early_stopper = None
-    if args.patience_evals > 0:
+    if tp["patience"] > 0:
         early_stopper = EarlyStopper(
-            patience_evals=args.patience_evals,
-            min_epochs=1,
+            patience_evals=tp["patience"],
+            min_delta=tp["min_delta"],
+            min_epochs=tp["min_epochs"],
+            window_size=tp["window_size"],
         )
-        write_status(f"EARLY_STOP enabled: patience={args.patience_evals} evals, min_epochs=1")
-
-    # ---- Train ----
-    t0 = time.time()
-    tp = get_train_params(train_cfg, args)
+        write_status(f"EARLY_STOP enabled: patience={tp['patience']} evals, "
+                     f"min_delta={tp['min_delta']}, min_epochs={tp['min_epochs']}, "
+                     f"window={tp['window_size']}")
 
     train_loop(model, train_loader, val_loader, optimizer, device,
-               num_epochs=total_epochs,
+               num_epochs=tp["epochs"],
                log_freq=tp["log_freq"],
                eval_freq=tp["eval_freq"],
                eval_iter=tp["eval_iter"],
