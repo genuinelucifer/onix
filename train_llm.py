@@ -83,13 +83,13 @@ def calc_loss_loader(loader, model, device, num_batches=None, use_bf16=False):
     return total / n
 
 
-def evaluate(model, train_loader, val_loader, device, eval_iter, use_bf16=False):
+def evaluate(model, val_loader, device, eval_iter, use_bf16=False):
+    """Run validation pass and return validation loss."""
     model.eval()
     with torch.no_grad():
-        tl = calc_loss_loader(train_loader, model, device, eval_iter)
-        vl = calc_loss_loader(val_loader, model, device, eval_iter)
+        vl = calc_loss_loader(val_loader, model, device, eval_iter, use_bf16=use_bf16)
     model.train()
-    return tl, vl
+    return vl
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +136,12 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                 )
 
             if global_step % eval_freq == 0:
-                tl, vl = evaluate(model, train_loader, val_loader,
-                                  device, eval_iter, use_bf16=use_bf16)
-                train_losses.append(tl)
+                vl = evaluate(model, val_loader, device, eval_iter, use_bf16=use_bf16)
+                train_losses.append(loss.item())
                 val_losses.append(vl)
                 write_status(
                     f"EVAL epoch={epoch+1}/{num_epochs} step={global_step:06d} "
-                    f"tokens={tokens_seen} train_loss={tl:.4f} val_loss={vl:.4f}"
+                    f"tokens={tokens_seen} val_loss={vl:.4f}"
                 )
 
                 # Early stopping check

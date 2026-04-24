@@ -140,13 +140,12 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                 )
 
             if global_step % eval_freq == 0:
-                tl = loss.item()
                 vl = evaluate_mm(model, val_loader, device, eval_iter, use_bf16=use_bf16)
-                train_losses.append(tl)
+                train_losses.append(loss.item())
                 val_losses.append(vl)
                 write_status(
                     f"EVAL epoch={epoch+1}/{num_epochs} step={global_step:06d} "
-                    f"train_loss={tl:.4f} val_loss={vl:.4f}"
+                    f"val_loss={vl:.4f}"
                 )
 
                 # Early stopping check

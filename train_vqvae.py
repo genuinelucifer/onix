@@ -222,7 +222,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                     model, val_loader, device, vqvae_config, eval_iter, use_bf16=use_bf16
                 )
                 val_loss = recon_l + vq_l
-                train_losses.append(loss_dict["total_loss"])
+                train_losses.append(total_loss.item())
                 val_losses.append(val_loss)
                 write_status(
                     f"EVAL epoch={epoch+1}/{num_epochs} step={global_step:06d} "
