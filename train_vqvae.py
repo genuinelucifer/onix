@@ -41,7 +41,7 @@ from model import (
 
 # Shared training utilities
 from training_utils import (
-    create_optimizer, setup_status_file, setup_device,
+    create_optimizer, setup_status_file, setup_device, setup_performance,
     migrate_optimizer_to_device, handle_resume_no_checkpoint, has_checkpoint,
     get_train_params, EarlyStopper,
     add_common_training_args, get_default_training_config,
@@ -304,6 +304,7 @@ def main():
 
     # ---- Setup ----
     setup_status_file(args.model_name, resume=args.resume)
+    setup_performance()
     device = setup_device()
     write_status(f"START [VQVAE] device={device} model_name={args.model_name}")
 

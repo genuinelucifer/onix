@@ -22,6 +22,14 @@ from model import (
 )
 
 
+def setup_performance():
+    """Enable global performance optimizations for modern GPUs."""
+    if torch.cuda.is_available():
+        # Enable TensorFloat32 for better performance on Ampere/ROCm GPUs
+        # This uses more VRAM but significantly increases matmul throughput.
+        torch.set_float32_matmul_precision('high')
+
+
 # ---------------------------------------------------------------------------
 #  Device
 # ---------------------------------------------------------------------------
