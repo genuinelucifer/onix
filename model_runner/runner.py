@@ -169,6 +169,13 @@ def load_model(
         raise ValueError(f"Unknown model type: {model_type}")
 
 
+def _strip_orig_mod_prefix(state_dict: dict) -> dict:
+    """Strip 'torch.compile' prefix (_orig_mod.) from state_dict keys if present."""
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    return state_dict
+
+
 def _load_vqvae(
     ckpt_path: Path, config: dict, device: torch.device, tokenizer
 ) -> LoadedModel:
@@ -177,10 +184,9 @@ def _load_vqvae(
     model = VQVAE(vqvae_config)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+    state_dict = _strip_orig_mod_prefix(state_dict)
+    model.load_state_dict(state_dict)
 
     model.to(device)
     model.eval()
@@ -207,10 +213,9 @@ def _load_multimodal(
     model = CausalLM(transformer_config)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+    state_dict = _strip_orig_mod_prefix(state_dict)
+    model.load_state_dict(state_dict)
 
     model.to(device)
     model.eval()
@@ -225,10 +230,9 @@ def _load_multimodal(
     if Path(vqvae_ckpt_path).exists():
         frozen_vqvae = VQVAE(mm_config.vqvae)
         vq_ckpt = torch.load(vqvae_ckpt_path, map_location="cpu", weights_only=False)
-        if "model_state_dict" in vq_ckpt:
-            frozen_vqvae.load_state_dict(vq_ckpt["model_state_dict"])
-        else:
-            frozen_vqvae.load_state_dict(vq_ckpt)
+        vq_state_dict = vq_ckpt["model_state_dict"] if "model_state_dict" in vq_ckpt else vq_ckpt
+        vq_state_dict = _strip_orig_mod_prefix(vq_state_dict)
+        frozen_vqvae.load_state_dict(vq_state_dict)
         frozen_vqvae.to(device)
         frozen_vqvae.eval()
         for p in frozen_vqvae.parameters():
@@ -255,10 +259,9 @@ def _load_llm(
     model = CausalLM(model_config)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    else:
-        model.load_state_dict(ckpt)
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+    state_dict = _strip_orig_mod_prefix(state_dict)
+    model.load_state_dict(state_dict)
 
     model.to(device)
     model.eval()
