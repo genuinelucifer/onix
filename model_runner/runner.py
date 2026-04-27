@@ -31,7 +31,7 @@ from architecture.config import ModelConfig, VQVAEConfig, MultiModalConfig
 from architecture.model import CausalLM
 from architecture.vqvae import VQVAE
 from architecture.generate import generate, generate_image
-from model import get_tokenizer, text_to_token_ids, token_ids_to_text
+from model import get_tokenizer, text_to_token_ids, token_ids_to_text, EOT_TOKEN_ID
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +404,7 @@ def run_llm_inference(
             top_k=params.top_k,
             top_p=params.top_p,
             repetition_penalty=params.repetition_penalty,
-            eos_id=params.eos_id,
+            eos_id=params.eos_id if params.eos_id is not None else EOT_TOKEN_ID,
         )
 
     # Extract only the new tokens
