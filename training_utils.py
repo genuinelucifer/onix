@@ -230,9 +230,9 @@ def add_common_training_args(parser):
     opt_group.add_argument("--optimizer", default=None,
                            choices=["adamw", "sgd", "adamw8bit", "sgd8bit"],
                            help="Optimizer to use")
-    opt_group.add_argument("--checkpointing", action="store_true",
+    opt_group.add_argument("--checkpointing", action="store_true", default=None,
                            help="Enable gradient checkpointing (saves VRAM)")
-    opt_group.add_argument("--bf16", action="store_true",
+    opt_group.add_argument("--bf16", action="store_true", default=None,
                            help="Use BFloat16 mixed precision training")
 
     # Early stopping
