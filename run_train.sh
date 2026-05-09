@@ -60,6 +60,10 @@ echo "  Monitor: tail -f $MODELS_DIR/$MODEL_NAME/status.txt"
 
 mkdir -p "$MODELS_DIR/$MODEL_NAME"
 
+# Persist torch.compile cache so it survives reboots (default /tmp/ is cleared)
+export TORCHINDUCTOR_CACHE_DIR="$SCRIPT_DIR/.torch_cache"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+
 nohup python -u train.py "${ARGS[@]}" "$@" \
     > "$MODELS_DIR/$MODEL_NAME/stdout.log" 2> "$MODELS_DIR/$MODEL_NAME/stderr.log" &
 
