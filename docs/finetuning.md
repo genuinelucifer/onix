@@ -10,7 +10,7 @@ python download_hf.py --dataset tiny-stories-instruct
 ```
 
 ## 2. Preprocess into JSONL Format
-The raw downloaded format (`train.json`) cannot be streamed efficiently because it contains fragmented text blocks. We run a preprocessing script to reconstruct the data into a standard Alpaca format (Instruction, Input, Output) and output it as a `.jsonl` (JSON Lines) file.
+The raw downloaded format (`train.json`) contains fragmented text blocks. We run a preprocessing script to reconstruct the data into a standard Alpaca format (Instruction, Input, Output) and output it as a `.jsonl` file.
 
 ```bash
 python utils/preprocess_tinystories_instruct_data.py \
@@ -18,29 +18,36 @@ python utils/preprocess_tinystories_instruct_data.py \
     --output datasets/tiny-stories-instruct/instruction-data.jsonl
 ```
 
-**Why JSONL?** 
-A standard 2.7GB `.json` array loads entirely into memory when parsed with `json.load()`. Due to Python's dictionary overhead, this causes CPU RAM to spike to **15-20 GB**, which can crash 32GB systems. By outputting `.jsonl`, the training script can stream the file line-by-line, tokenize the text instantly into a zero-overhead `array.array('i')`, and store the entire 375-million token dataset in just **1.5 GB of CPU RAM**.
+## 3. Pre-tokenize into Binary Shards (Recommended)
+For large datasets (e.g., 2.7GB JSONL), tokenizing in-memory during training startup can cause massive RAM spikes due to Python's object overhead. To achieve near-zero RAM startup and instant loading, convert the JSONL into binary `.npy` shards.
 
-## 3. Fine-Tune the Base Model
-Once the `.jsonl` data is prepared, launch the fine-tuning run using the background worker script. This command utilizes the same performance optimizations (BF16, Torch Compile, DataLoader Prefetching) as the pre-training script.
+```bash
+python utils/preprocess_sft.py \
+    --input datasets/tiny-stories-instruct/instruction-data.jsonl \
+    --output datasets/tiny-stories-instruct/processed
+```
+
+**Why Binary?**
+Binary shards are memory-mapped (`mmap`). This allows the training script to stream tokens directly from disk to VRAM without using CPU RAM. It also bypasses the slow tokenization loop, making the script start training almost instantly.
+
+## 4. Fine-Tune the Base Model
+Launch the fine-tuning run using the background worker script. If you pre-tokenized the data in Step 3, point `--data` to the prefix of your binary files.
 
 ```bash
 ./run_finetune.sh llama1b-sft \
     --base-model llama1b-8192-v6 \
-    --data datasets/tiny-stories-instruct/instruction-data.jsonl \
+    --data datasets/tiny-stories-instruct/processed \
     --batch-size 32 \
     --bf16 \
     --compile \
-    --num-workers 4 \
-    --prefetch-factor 2 \
-    --eval-freq 500 \
-    --save-iters 1000
+    --checkpointing \
+    --num-workers 4
 ```
 
-*Note: For fine-tuning, `batch-size` can be significantly increased (e.g., to 32) compared to pre-training because instruction/response lengths are generally much shorter than the full 8192 context window.*
+*Note: If you haven't pre-tokenized, you can still pass the `.jsonl` file directly, but be prepared for a longer startup time and higher RAM usage.*
 
-## 4. Monitor Training
-Track the epoch progress, loss, and hardware status using the status monitor:
+## 5. Monitor Training
+Track progress, loss, and hardware status:
 
 ```bash
 ./train_status.sh llama1b-sft

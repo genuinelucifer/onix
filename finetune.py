@@ -21,6 +21,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
+import warnings
+
+# Suppress the warning about non-writable numpy arrays from mmap
+warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
 
 from architecture import ModelConfig, CausalLM, PRESETS, get_preset
 from architecture.generate import generate
@@ -337,40 +341,61 @@ def main():
         data_path = args.data
 
     # ---- Load data ----
-    import array
-    tokens_array = array.array('i')
-    bounds_list = []
-    current_idx = 0
-    count = 0
+    # We check if pre-tokenized binary shards exist to avoid expensive in-memory tokenization.
+    tokens_path = Path(f"{data_path}_tokens.npy")
+    bounds_path = Path(f"{data_path}_bounds.npy")
     
-    write_status(f"DATA loading and tokenizing from {data_path} (Streaming)")
-    with open(data_path, "r") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            entry = json.loads(line)
-            full = format_input_alpaca(entry) + f"\n\n### Response:\n{entry['output']}"
-            tokens = tokenizer.encode(full)
-            tokens_array.extend(tokens)
-            bounds_list.append((current_idx, current_idx + len(tokens)))
-            current_idx += len(tokens)
-            count += 1
-            if count % 500000 == 0:
-                write_status(f"DATA tokenized {count} entries...")
-                
-    write_status(f"DATA loaded {count} entries into {len(tokens_array)/1e6:.1f}M tokens")
-    
-    # Move tokens to VRAM immediately to free CPU RAM
-    # We use int32 to save space, and convert to long on the fly or just use long if it fits.
-    # 700M tokens * 8 bytes = 5.6 GB. Fits easily in 96GB VRAM.
-    all_tokens_tensor = torch.tensor(tokens_array, dtype=torch.long, device=device)
-    
-    # Free the temporary array
-    del tokens_array
-    
-    # Convert bounds to a compact numpy array
-    bounds = np.array(bounds_list, dtype=np.int32)
-    del bounds_list
+    if tokens_path.exists() and bounds_path.exists():
+        write_status(f"DATA: Loading pre-tokenized binary shards from {data_path} (mmap)")
+        # Memory-map the arrays to keep CPU RAM usage near zero
+        tokens_np = np.load(tokens_path, mmap_mode="r")
+        bounds = np.load(bounds_path, mmap_mode="r")
+        
+        # Move tokens to VRAM. 
+        # Even with 700M tokens, this is only 2.8GB (int32) or 5.6GB (int64).
+        all_tokens_tensor = torch.from_numpy(tokens_np).to(torch.long).to(device)
+        
+        # For bounds, we keep a copy in CPU RAM for fast indexing in the Dataset
+        bounds = bounds.copy()
+        
+        write_status(f"DATA loaded {len(bounds)} entries into {len(tokens_np)/1e6:.1f}M tokens")
+    else:
+        import array
+        tokens_array = array.array('i')
+        # Use a flat array for bounds to avoid creating millions of Python tuple objects
+        bounds_array = array.array('i') 
+        current_idx = 0
+        count = 0
+        
+        write_status(f"DATA loading and tokenizing from {data_path} (Streaming)")
+        with open(data_path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                full = format_input_alpaca(entry) + f"\n\n### Response:\n{entry['output']}"
+                tokens = tokenizer.encode(full)
+                tokens_array.extend(tokens)
+                bounds_array.extend([current_idx, current_idx + len(tokens)])
+                current_idx += len(tokens)
+                count += 1
+                if count % 500000 == 0:
+                    write_status(f"DATA tokenized {count} entries...")
+                    
+        write_status(f"DATA loaded {count} entries into {len(tokens_array)/1e6:.1f}M tokens")
+        
+        # Zero-copy conversion to numpy, then move to GPU. 
+        # This avoids the "Python object explosion" that occurs with torch.tensor(array_array).
+        tokens_np = np.frombuffer(tokens_array, dtype=np.int32)
+        all_tokens_tensor = torch.from_numpy(tokens_np).to(torch.long).to(device)
+        
+        # Free the temporary CPU arrays
+        del tokens_array
+        del tokens_np
+        
+        # Convert flat bounds to [N, 2] numpy array
+        bounds = np.frombuffer(bounds_array, dtype=np.int32).reshape(-1, 2).copy()
+        del bounds_array
     
     gc.collect()
     if device.type == "cuda":
@@ -440,12 +465,16 @@ def main():
         write_status("torch.compile: Compiling model... (This will take a few minutes)")
         model = torch.compile(model)
 
-    start_ctx = "Hello"
-    with open(data_path, "r") as f:
-        for line in f:
-            if line.strip():
-                start_ctx = format_input_alpaca(json.loads(line))
-                break
+    start_ctx = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nTell me a story."
+    try:
+        with open(data_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    start_ctx = format_input_alpaca(json.loads(line))
+                    break
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, json.JSONDecodeError):
+        # Fallback for binary data or missing JSONL
+        pass
 
     # ---- Train ----
     t0 = time.time()
