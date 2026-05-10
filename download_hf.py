@@ -42,6 +42,11 @@ DATASETS = {
         "description": "70k complex instructions generated via Evol-Instruct.",
         "type": "sft"
     },
+    "tiny-stories-instruct": {
+        "path": "roneneldan/TinyStoriesInstruct",
+        "description": "Instruction fine-tuning dataset for TinyStories.",
+        "type": "sft"
+    },
 
     # --- Vision & Multimodal ---
     "tiny-imagenet": {

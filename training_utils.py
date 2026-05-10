@@ -24,6 +24,7 @@ from model import (
 
 def setup_performance():
     """Enable global performance optimizations for modern GPUs."""
+
     if torch.cuda.is_available():
         # Enable TensorFloat32 for better performance on Ampere/ROCm GPUs
         # This uses more VRAM but significantly increases matmul throughput.
@@ -147,11 +148,10 @@ def has_checkpoint(model_name, tag="latest"):
 #  Training parameter extraction
 # ---------------------------------------------------------------------------
 
-# Cosmetic: safe to change even if resuming from a checkpoint
 _COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
     "patience", "min_delta", "min_epochs", "window_size", "bf16",
-    "num_workers", "pin_memory", "prefetch_factor", "compile",
+    "num_workers", "pin_memory", "prefetch_factor", "compile", "checkpointing",
 ]
 
 # Functional: potentially disruptive to change mid-training if a checkpoint exists
@@ -170,6 +170,18 @@ DEFAULT_CONFIGS = {
         "bf16": False,
         "num_workers": 0, "pin_memory": False, "prefetch_factor": 2,
         "compile": False,
+        "checkpointing": False,
+    },
+    "sft": {
+        "epochs": 2, "batch_size": 8, "lr": 5e-5,
+        "save_every": 1, "save_iters": 0,
+        "eval_freq": 5, "log_freq": 1, "eval_iter": 5,
+        "optimizer": "adamw",
+        "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
+        "bf16": False,
+        "num_workers": 4, "pin_memory": True, "prefetch_factor": 2,
+        "compile": False,
+        "checkpointing": False,
     },
     "vqvae": {
         "epochs": 100, "batch_size": 16, "lr": 3e-4,
@@ -180,6 +192,7 @@ DEFAULT_CONFIGS = {
         "bf16": False,
         "num_workers": 4, "pin_memory": True, "prefetch_factor": 2,
         "compile": False,
+        "checkpointing": False,
     },
     "multimodal": {
         "epochs": 50, "batch_size": 32, "lr": 4e-4,
@@ -192,6 +205,7 @@ DEFAULT_CONFIGS = {
         "pin_memory": False,
         "prefetch_factor": 2,
         "compile": False,
+        "checkpointing": False,
     }
 }
 

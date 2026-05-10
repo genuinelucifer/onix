@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Run YALLM instruction fine-tuning in the background.
 #
-# New run:    ./run_finetune.sh my-sft
-# Resume:    ./run_finetune.sh my-sft --resume
-# Override:  EPOCHS=5 DATA=custom.json ./run_finetune.sh my-sft
+# Usage:
+#   ./run_finetune.sh my-sft --data instruction-data.json
+#   ./run_finetune.sh my-sft --base-model llama1b-8192-v6 --data instruction-data.json
+#   ./run_finetune.sh my-sft --resume
+#   ./run_finetune.sh my-sft --resume --epochs 5
 #
 # Monitor:   tail -f models/<model_name>/status.txt
 # Stop:      kill $(cat models/<model_name>/.pid)
@@ -18,31 +20,34 @@ source ~/repos/pytorch_env/bin/activate
 MODEL_NAME="${1:?Usage: $0 <model_name> [extra args]}"
 shift
 
-# Default args (override via env vars)
-DATA="${DATA:-../instruction-data.json}"
-EPOCHS="${EPOCHS:-2}"
-MODEL_SIZE="${MODEL_SIZE:-355M}"
-SAVE_EVERY="${SAVE_EVERY:-1}"
+MODELS_DIR="$SCRIPT_DIR/models"
 
-# Build args list
-ARGS=(--model-name "$MODEL_NAME")
+# Force experimental Flash/Mem-Eff Attention on AMD Consumer GPUs
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 
-# Only add defaults if not resuming
-if [[ " $* " != *" --resume "* ]]; then
-    ARGS+=(--data "$DATA" --model-size "$MODEL_SIZE")
+# Safety check: is model already training?
+if [ -f "$MODELS_DIR/$MODEL_NAME/.pid" ]; then
+    PID=$(cat "$MODELS_DIR/$MODEL_NAME/.pid")
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "ERROR: Training is already running for '$MODEL_NAME' (PID $PID)."
+        echo "Check status: tail -f $MODELS_DIR/$MODEL_NAME/status.txt"
+        echo "To stop it first: kill $PID"
+        exit 1
+    fi
 fi
-ARGS+=(--epochs "$EPOCHS" --save-every "$SAVE_EVERY")
-
-MODELS_DIR="${YALLM_MODELS_DIR:-$SCRIPT_DIR/models}"
 
 echo "Starting instruction fine-tuning in background..."
 echo "  model_name=$MODEL_NAME"
-echo "  args: ${ARGS[*]} $*"
+echo "  args: $*"
 echo "  Monitor: tail -f $MODELS_DIR/$MODEL_NAME/status.txt"
 
 mkdir -p "$MODELS_DIR/$MODEL_NAME"
 
-nohup python -u finetune.py "${ARGS[@]}" "$@" \
+# Persist torch.compile cache so it survives reboots (default /tmp/ is cleared)
+export TORCHINDUCTOR_CACHE_DIR="$SCRIPT_DIR/.torch_cache"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+
+nohup python -u finetune.py --model-name "$MODEL_NAME" "$@" \
     > "$MODELS_DIR/$MODEL_NAME/stdout.log" 2> "$MODELS_DIR/$MODEL_NAME/stderr.log" &
 
 echo $! > "$MODELS_DIR/$MODEL_NAME/.pid"
