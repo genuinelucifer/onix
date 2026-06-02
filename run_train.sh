@@ -15,7 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Activate venv
-source ~/repos/pytorch_env/bin/activate
+if [ -d "onix_env" ]; then
+    source onix_env/bin/activate
+else
+    echo "WARNING: Could not find onix_env, assuming the user has activated the correct environment already and proceeding"
+fi
 
 
 MODEL_NAME="${1:?Usage: $0 <model_name> [--mode <llm|vqvae|multimodal>] [--preset <preset> | --config <file>] [extra args]}"

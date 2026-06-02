@@ -2,18 +2,45 @@
 
 YALLM is a comprehensive, high-performance training suite designed for building modern text-only transformers (GPT-2, LLaMA, Mistral, etc.) and autoregressive generative image models (VQ-VAE tokenizers + Multimodal generation).
 
-## 🚀 Quick Start
+## 🛠️ Developer Setup
 
-### 1. Environment Setup
+Follow these steps to set up your local development environment:
+
+### 1. Create a Python Virtual Environment
+It is recommended to use Python 3.10+ for full compatibility with ROCm and PyTorch. Run the following commands to create your virtual environment inside the repository:
+
 ```bash
-# Ensure you are using the correct virtual environment
-source ~/repos/pytorch_env/bin/activate
-cd ~/repos/yallm/myllms
+# Navigate to the workspace
+cd onix
+
+# Create the virtual environment
+python3 -m venv onix_env
 ```
 
-### 2. Available Modalities & Examples
+### 2. Enable/Activate the Virtual Environment
+Activate the environment to ensure pip installs packages to this isolated sandbox:
 
-The framework uses a unified `.sh` tracking structure. Depending on the modality, simply refer to a pre-defined architecture preset or a custom JSON config.
+```bash
+# Activate the virtual environment
+source onix_env/bin/activate
+```
+
+### 3. Install Project Dependencies from `requirements.txt`
+Install all required libraries. The `requirements.txt` is pre-configured with the PyTorch ROCm index URL, so this single command will automatically fetch the ROCm-optimized PyTorch packages along with all data processing, tokenization, and web GUI tools:
+
+```bash
+# Upgrade pip to ensure smooth wheel builds
+pip install --upgrade pip
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+---
+
+## 🚀 Quick Start
+
+The framework uses a unified `.sh` tracking structure. Depending on the modality, simply refer to a pre-defined architecture preset or a custom JSON config. Ensure your virtual environment is active (`source onix_env/bin/activate`) before running any scripts.
 
 **A. Standard Text LLMs**
 Run standard transformer training optimized for memory via 8-bit `adamw` bitsandbytes implementations.
