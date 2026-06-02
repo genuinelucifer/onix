@@ -261,7 +261,7 @@ def main():
                              help="Legacy compatibility mapping (e.g. 124M -> gpt2-124m)")
     arch_group.add_argument("--context-length", type=int, default=None,
                             help="Override context length (default: from preset/config)")
-    arch_group.add_argument("--use-sdpa", action="store_true", default=True,
+    arch_group.add_argument("--use-sdpa", action="store_true", default=None,
                             help="Use Scaled Dot Product Attention (default: True)")
     arch_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
                             help="Disable SDPA")
@@ -342,8 +342,10 @@ def main():
         # Override context length and memory optimizations if specified
         if args.context_length:
             model_config.context_length = args.context_length
-        model_config.use_sdpa = args.use_sdpa
-        model_config.grad_checkpointing = args.checkpointing
+        if args.use_sdpa is not None:
+            model_config.use_sdpa = args.use_sdpa
+        if args.checkpointing is not None:
+            model_config.grad_checkpointing = args.checkpointing
 
         model = create_model_from_config(model_config, device)
         context_length = model_config.context_length

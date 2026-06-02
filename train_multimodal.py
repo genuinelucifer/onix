@@ -260,7 +260,7 @@ def main():
                         help="Path to image+text pairs or pre-encoded shards")
     mm_group.add_argument("--pre-encoded", action="store_true",
                         help="Data is pre-encoded (from encode_dataset.py)")
-    mm_group.add_argument("--use-sdpa", action="store_true", default=True,
+    mm_group.add_argument("--use-sdpa", action="store_true", default=None,
                         help="Use Scaled Dot Product Attention (default: True)")
     mm_group.add_argument("--no-sdpa", action="store_false", dest="use_sdpa",
                         help="Disable SDPA")
@@ -306,7 +306,8 @@ def main():
         transformer_config = mm_config.build_transformer_config()
         if args.checkpointing:
             transformer_config.grad_checkpointing = True
-        transformer_config.use_sdpa = args.use_sdpa
+        if args.use_sdpa is not None:
+            transformer_config.use_sdpa = args.use_sdpa
 
         torch.manual_seed(123)
         model = CausalLM(transformer_config).to(device)
