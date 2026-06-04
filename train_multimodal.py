@@ -110,7 +110,7 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                           start_epoch=0, start_global_step=-1,
                           prev_train_losses=None, prev_val_losses=None,
                           frozen_vqvae=None, tokenizer=None,
-                          early_stopper=None, use_bf16=False):
+                          early_stopper=None, use_bf16=False, save_limit=3):
     """Main multi-modal training loop."""
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
@@ -161,10 +161,10 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                         )
                         ckpt_path = save_checkpoint(
                             model_name, model, optimizer, epoch + 1, global_step,
-                            0, train_losses, val_losses, tag="early_stop")
+                            0, train_losses, val_losses, tag="early_stop", keep_last_n=save_limit)
                         save_checkpoint(
                             model_name, model, optimizer, epoch + 1, global_step,
-                            0, train_losses, val_losses)
+                            0, train_losses, val_losses, keep_last_n=save_limit)
                         write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
 
                         # Final sample before return
@@ -190,7 +190,7 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
                 if global_step % save_every_n_iters == 0:
                     ckpt_path = save_checkpoint(
                         model_name, model, optimizer, epoch, global_step,
-                        0, train_losses, val_losses, tag=f"step{global_step}")
+                        0, train_losses, val_losses, tag=f"step{global_step}", keep_last_n=save_limit)
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
 
         # Epoch completed
@@ -227,16 +227,16 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
         if (epoch + 1) % save_every_n_epochs == 0:
             ckpt_path = save_checkpoint(
                 model_name, model, optimizer, epoch + 1, global_step,
-                0, train_losses, val_losses)
+                0, train_losses, val_losses, keep_last_n=save_limit)
             write_status(f"CHECKPOINT saved at epoch {epoch+1} -> {ckpt_path}")
 
     # Final
     ckpt_path = save_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
-        0, train_losses, val_losses, tag="final")
+        0, train_losses, val_losses, tag="final", keep_last_n=save_limit)
     save_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
-        0, train_losses, val_losses)
+        0, train_losses, val_losses, keep_last_n=save_limit)
     write_status(f"FINAL checkpoint saved -> {ckpt_path}")
 
     return train_losses, val_losses
@@ -389,6 +389,7 @@ def main():
         tokenizer=tokenizer,
         early_stopper=early_stopper,
         use_bf16=tp["bf16"],
+        save_limit=tp["save_limit"],
     )
     
     elapsed = (time.time() - t0) / 60

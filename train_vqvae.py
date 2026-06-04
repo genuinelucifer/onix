@@ -53,7 +53,7 @@ from training_utils import (
 # ---------------------------------------------------------------------------
 
 def save_vqvae_checkpoint(model_name, model, optimizer, epoch, global_step,
-                          train_losses, val_losses, tag=None):
+                          train_losses, val_losses, tag=None, keep_last_n=3):
     """Save a VQ-VAE checkpoint."""
     import os
     d = get_model_dir(model_name)
@@ -73,14 +73,14 @@ def save_vqvae_checkpoint(model_name, model, optimizer, epoch, global_step,
         latest.unlink()
     os.symlink(fname, latest)
 
-    # Keep only latest 3 checkpoints (excluding final)
-    if tag != "final":
+    # Keep only latest keep_last_n checkpoints (excluding final)
+    if tag != "final" and keep_last_n > 0:
         checkpoints = sorted(
             [p for p in d.glob("checkpoint_*.pt")
              if "latest" not in p.name and "final" not in p.name],
             key=lambda p: os.path.getmtime(p)
         )
-        while len(checkpoints) > 3:
+        while len(checkpoints) > keep_last_n:
             old = checkpoints.pop(0)
             if old.name != fname:
                 try:
@@ -178,7 +178,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                      model_name, save_every_n_epochs, save_every_n_iters=None,
                      start_epoch=0, start_global_step=-1,
                      prev_train_losses=None, prev_val_losses=None,
-                     early_stopper=None, use_bf16=False):
+                     early_stopper=None, use_bf16=False, save_limit=3):
     """Main VQ-VAE training loop."""
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
@@ -245,10 +245,10 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                         )
                         ckpt_path = save_vqvae_checkpoint(
                             model_name, model, optimizer, epoch + 1, global_step,
-                            train_losses, val_losses, tag="early_stop")
+                            train_losses, val_losses, tag="early_stop", keep_last_n=save_limit)
                         save_vqvae_checkpoint(
                             model_name, model, optimizer, epoch + 1, global_step,
-                            train_losses, val_losses)
+                            train_losses, val_losses, keep_last_n=save_limit)
                         write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
                         return train_losses, val_losses
 
@@ -256,7 +256,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
                 if global_step % save_every_n_iters == 0:
                     ckpt_path = save_vqvae_checkpoint(
                         model_name, model, optimizer, epoch, global_step,
-                        train_losses, val_losses, tag=f"step{global_step}")
+                        train_losses, val_losses, tag=f"step{global_step}", keep_last_n=save_limit)
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
 
         # Epoch completed
@@ -266,16 +266,16 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
         if (epoch + 1) % save_every_n_epochs == 0:
             ckpt_path = save_vqvae_checkpoint(
                 model_name, model, optimizer, epoch + 1, global_step,
-                train_losses, val_losses)
+                train_losses, val_losses, keep_last_n=save_limit)
             write_status(f"CHECKPOINT saved at epoch {epoch+1} -> {ckpt_path}")
 
     # Final
     ckpt_path = save_vqvae_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
-        train_losses, val_losses, tag="final")
+        train_losses, val_losses, tag="final", keep_last_n=save_limit)
     save_vqvae_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
-        train_losses, val_losses)
+        train_losses, val_losses, keep_last_n=save_limit)
     write_status(f"FINAL checkpoint saved -> {ckpt_path}")
 
     return train_losses, val_losses
@@ -431,6 +431,7 @@ def main():
         prev_val_losses=prev_vl,
         early_stopper=stopper,
         use_bf16=tp["bf16"],
+        save_limit=tp["save_limit"],
     )
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE VQ-VAE training completed in {elapsed:.2f} min")

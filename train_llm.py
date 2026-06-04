@@ -101,7 +101,7 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                model_name, save_every_n_epochs, save_every_n_iters=None,
                start_epoch=0, start_global_step=-1, start_tokens_seen=0,
                prev_train_losses=None, prev_val_losses=None,
-               early_stopper=None, use_bf16=False):
+               early_stopper=None, use_bf16=False, save_limit=3):
     train_losses = list(prev_train_losses or [])
     val_losses = list(prev_val_losses or [])
     tokens_seen = start_tokens_seen
@@ -158,10 +158,10 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                         # Save checkpoint before stopping
                         ckpt_path = save_checkpoint(
                             model_name, model, optimizer, epoch + 1, global_step,
-                            tokens_seen, train_losses, val_losses, tag="early_stop")
+                            tokens_seen, train_losses, val_losses, tag="early_stop", keep_last_n=save_limit)
                         save_checkpoint(
                             model_name, model, optimizer, epoch + 1, global_step,
-                            tokens_seen, train_losses, val_losses)
+                            tokens_seen, train_losses, val_losses, keep_last_n=save_limit)
                         write_status(f"CHECKPOINT saved (early stop) -> {ckpt_path}")
 
                         # Final sample before return
@@ -183,7 +183,7 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
                     # Save current epoch (not epoch + 1) because the epoch is not yet complete
                     ckpt_path = save_checkpoint(
                         model_name, model, optimizer, epoch, global_step,
-                        tokens_seen, train_losses, val_losses, tag=f"step{global_step}")
+                        tokens_seen, train_losses, val_losses, tag=f"step{global_step}", keep_last_n=save_limit)
                     write_status(f"CHECKPOINT saved at step {global_step} -> {ckpt_path}")
 
         # Epoch completed
@@ -202,16 +202,16 @@ def train_loop(model, train_loader, val_loader, optimizer, device,
         if (epoch + 1) % save_every_n_epochs == 0:
             ckpt_path = save_checkpoint(
                 model_name, model, optimizer, epoch + 1, global_step,
-                tokens_seen, train_losses, val_losses)
+                tokens_seen, train_losses, val_losses, keep_last_n=save_limit)
             write_status(f"CHECKPOINT saved at epoch {epoch+1} -> {ckpt_path}")
 
     # Final checkpoint (always)
     ckpt_path = save_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
-        tokens_seen, train_losses, val_losses, tag="final")
+        tokens_seen, train_losses, val_losses, tag="final", keep_last_n=save_limit)
     save_checkpoint(
         model_name, model, optimizer, num_epochs, global_step,
-        tokens_seen, train_losses, val_losses)
+        tokens_seen, train_losses, val_losses, keep_last_n=save_limit)
     write_status(f"FINAL checkpoint saved -> {ckpt_path}")
 
     return train_losses, val_losses
@@ -459,7 +459,8 @@ def main():
                prev_train_losses=prev_tl,
                prev_val_losses=prev_vl,
                early_stopper=early_stopper,
-               use_bf16=tp["bf16"])
+               use_bf16=tp["bf16"],
+               save_limit=tp["save_limit"])
 
     elapsed = (time.time() - t0) / 60
     write_status(f"DONE training completed in {elapsed:.2f} min")

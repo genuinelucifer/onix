@@ -152,6 +152,7 @@ _COSMETIC_PARAMS = [
     "save_every", "save_iters", "log_freq", "eval_freq", "eval_iter",
     "patience", "min_delta", "min_epochs", "window_size", "bf16",
     "num_workers", "pin_memory", "prefetch_factor", "compile", "checkpointing",
+    "save_limit",
 ]
 
 # Functional: potentially disruptive to change mid-training if a checkpoint exists
@@ -164,6 +165,7 @@ DEFAULT_CONFIGS = {
     "llm": {
         "epochs": 10, "batch_size": 8, "lr": 4e-4,
         "save_every": 5, "save_iters": 0,
+        "save_limit": 3,
         "eval_freq": 50, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
@@ -175,6 +177,7 @@ DEFAULT_CONFIGS = {
     "sft": {
         "epochs": 2, "batch_size": 8, "lr": 5e-5,
         "save_every": 1, "save_iters": 0,
+        "save_limit": 3,
         "eval_freq": 5, "log_freq": 1, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
@@ -186,6 +189,7 @@ DEFAULT_CONFIGS = {
     "vqvae": {
         "epochs": 100, "batch_size": 16, "lr": 3e-4,
         "save_every": 10, "save_iters": 0,
+        "save_limit": 3,
         "eval_freq": 100, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
@@ -197,6 +201,7 @@ DEFAULT_CONFIGS = {
     "multimodal": {
         "epochs": 50, "batch_size": 32, "lr": 4e-4,
         "save_every": 5, "save_iters": 0,
+        "save_limit": 3,
         "eval_freq": 100, "log_freq": 5, "eval_iter": 5,
         "optimizer": "adamw",
         "patience": 6, "min_delta": 1e-4, "min_epochs": 2, "window_size": 3,
@@ -232,6 +237,8 @@ def add_common_training_args(parser):
                            help="Save checkpoint every N epochs")
     log_group.add_argument("--save-iters", type=int, default=None,
                            help="Save checkpoint every N iterations (0 to disable)")
+    log_group.add_argument("--save-limit", type=int, default=None,
+                           help="Maximum number of recent checkpoints to keep (0 to keep all)")
     log_group.add_argument("--eval-freq", type=int, default=None,
                            help="Evaluate every N steps")
     log_group.add_argument("--log-freq", type=int, default=None,

@@ -48,7 +48,7 @@ def load_model_config(model_name):
 
 
 def save_checkpoint(model_name, model, optimizer, epoch, global_step,
-                    tokens_seen, train_losses, val_losses, tag=None):
+                    tokens_seen, train_losses, val_losses, tag=None, keep_last_n=3):
     """Save a training checkpoint to models/<model_name>/."""
     d = get_model_dir(model_name)
     fname = f"checkpoint_step{global_step}.pt" if tag is None else f"checkpoint_{tag}.pt"
@@ -67,13 +67,13 @@ def save_checkpoint(model_name, model, optimizer, epoch, global_step,
         latest.unlink()
     os.symlink(fname, latest)
     
-    # Keep only the latest 3 checkpoints across all epochs/steps (excluding final)
-    if tag != "final":
+    # Keep only the latest keep_last_n checkpoints across all epochs/steps (excluding final)
+    if tag != "final" and keep_last_n > 0:
         checkpoints = sorted(
             [p for p in d.glob("checkpoint_*.pt") if "latest" not in p.name and "final" not in p.name],
             key=lambda p: os.path.getmtime(p)
         )
-        while len(checkpoints) > 3:
+        while len(checkpoints) > keep_last_n:
             old_ckpt = checkpoints.pop(0)
             if old_ckpt.name != fname:
                 try:
