@@ -12,8 +12,13 @@ Usage:
 
 import argparse
 import json
-import os
+import time
 from pathlib import Path
+
+import numpy as np
+import tiktoken
+from datasets import load_dataset
+from huggingface_hub import snapshot_download
 
 DATASETS = {
     # --- Instruction Fine-tuning (SFT) ---
@@ -101,17 +106,56 @@ DATASETS = {
         "name": "wikitext-103-v1",
         "description": "Large-scale collection of high-quality Wikipedia articles.",
         "type": "text"
+    },
+
+    # --- Pretraining (Tokenized Shards) ---
+    "fineweb-edu-10bt": {
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "split": "train",
+        "text_field": "text",
+        "description": "FineWeb-Edu 10B token sample - high-quality educational web text.",
+        "type": "text",
+        "tokenized": True,
+        "tokenizer": "gpt2",
+        "approx_tokens": 10_000_000_000
+    },
+    "fineweb-edu-100bt": {
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-100BT",
+        "split": "train",
+        "text_field": "text",
+        "description": "FineWeb-Edu 100B token sample.",
+        "type": "text",
+        "tokenized": True,
+        "tokenizer": "gpt2",
+        "approx_tokens": 100_000_000_000
+    },
+    "slimpajama": {
+        "path": "cerebras/SlimPajama-627B",
+        "name": None,
+        "split": "train",
+        "text_field": "text",
+        "description": "SlimPajama 627B - diverse cleaned web+book+code data.",
+        "type": "text",
+        "tokenized": True,
+        "tokenizer": "gpt2",
+        "approx_tokens": 627_000_000_000
+    },
+    "tiny-stories": {
+        "path": "roneneldan/TinyStories",
+        "name": None,
+        "split": "train",
+        "text_field": "text",
+        "description": "TinyStories - small dataset for testing (~470M tokens).",
+        "type": "text",
+        "tokenized": True,
+        "tokenizer": "gpt2",
+        "approx_tokens": 470_000_000
     }
 }
 
-def download(name, out_dir=None, shard_limit=None):
-    try:
-        from datasets import load_dataset
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        print("Error: 'datasets' or 'huggingface_hub' library not found. Install them with: pip install datasets huggingface_hub")
-        return
-
+def download(name, out_dir=None, shard_limit=None, max_tokens=None, tokens_per_shard=None):
     if name not in DATASETS:
         print(f"Error: Dataset '{name}' not found in registry.")
         return
@@ -126,6 +170,138 @@ def download(name, out_dir=None, shard_limit=None):
         out_dir = Path(out_dir) / name
     
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Handle tokenized datasets (e.g. pretraining datasets tokenized into shards)
+    if info.get("tokenized", False):
+
+        if tokens_per_shard is None:
+            tokens_per_shard = 100_000_000  # 100M tokens per shard (~200MB as uint16)
+
+        split = info.get("split", "train")
+        text_field = info.get("text_field", "text")
+        approx_tokens = info.get("approx_tokens", 0)
+
+        print(f"\nDataset:    {info['description']}")
+        print(f"HF path:    {path} ({config_name or 'default'})")
+        print(f"Output:     {out_dir}")
+        print(f"Max tokens: {max_tokens or 'all (~' + str(approx_tokens // 1_000_000_000) + 'B)'}")
+        print(f"Shard size: {tokens_per_shard:,} tokens\n")
+
+        # Check for existing progress
+        metadata_path = out_dir / "metadata.json"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    existing = json.load(f)
+                print(f"Resuming: found {existing['total_tokens']:,} tokens in {existing['num_shards']} shards")
+                shard_idx = existing["num_shards"]
+                total_tokens = existing["total_tokens"]
+                docs_processed = existing.get("docs_processed", 0)
+            except Exception:
+                shard_idx = 0
+                total_tokens = 0
+                docs_processed = 0
+        else:
+            shard_idx = 0
+            total_tokens = 0
+            docs_processed = 0
+
+        if max_tokens and total_tokens >= max_tokens:
+            print(f"Already have {total_tokens:,} tokens (target: {max_tokens:,}). Done.")
+            return
+
+        tokenizer_name = info.get("tokenizer", "gpt2")
+        tokenizer = tiktoken.get_encoding(tokenizer_name)
+        EOT_TOKEN_ID = 50256
+
+        # Stream dataset
+        print("Loading dataset (streaming mode)...")
+        ds = load_dataset(
+            path,
+            name=config_name,
+            split=split,
+            streaming=True,
+        )
+
+        # Skip already-processed documents
+        if docs_processed > 0:
+            print(f"Skipping {docs_processed:,} already-processed documents...")
+            ds = ds.skip(docs_processed)
+
+        current_shard = []
+        t0 = time.time()
+
+        try:
+            for doc in ds:
+                text = doc[text_field]
+                if not text or not text.strip():
+                    docs_processed += 1
+                    continue
+
+                tokens = tokenizer.encode(text, allowed_special="all")
+                tokens.append(EOT_TOKEN_ID)  # document separator
+                current_shard.extend(tokens)
+                docs_processed += 1
+
+                # Shard is full — write it
+                while len(current_shard) >= tokens_per_shard:
+                    shard_data = np.array(current_shard[:tokens_per_shard], dtype=np.uint16)
+                    shard_path = out_dir / f"shard_{shard_idx:05d}.npy"
+                    np.save(shard_path, shard_data)
+
+                    total_tokens += tokens_per_shard
+                    current_shard = current_shard[tokens_per_shard:]
+                    shard_idx += 1
+
+                    elapsed = time.time() - t0
+                    rate = total_tokens / elapsed if elapsed > 0 else 0
+                    print(f"  Shard {shard_idx:5d} saved | "
+                          f"{total_tokens / 1e9:.2f}B tokens | "
+                          f"{rate / 1e6:.1f}M tok/s | "
+                          f"{docs_processed:,} docs")
+
+                    # Save progress
+                    with open(metadata_path, "w") as f:
+                        json.dump({
+                            "dataset": name,
+                            "num_shards": shard_idx,
+                            "total_tokens": total_tokens,
+                            "docs_processed": docs_processed,
+                            "tokens_per_shard": tokens_per_shard,
+                            "vocab_size": 50257,
+                            "tokenizer": "tiktoken-gpt2",
+                        }, f, indent=2)
+
+                    if max_tokens and total_tokens >= max_tokens:
+                        print(f"\nReached target of {max_tokens:,} tokens.")
+                        return
+
+        except KeyboardInterrupt:
+            print("\nInterrupted! Saving progress...")
+
+        # Save any remaining tokens as a final partial shard
+        if current_shard:
+            shard_data = np.array(current_shard, dtype=np.uint16)
+            shard_path = out_dir / f"shard_{shard_idx:05d}.npy"
+            np.save(shard_path, shard_data)
+            total_tokens += len(current_shard)
+            shard_idx += 1
+            print(f"  Shard {shard_idx} saved (partial: {len(current_shard):,} tokens)")
+
+        with open(metadata_path, "w") as f:
+            json.dump({
+                "dataset": name,
+                "num_shards": shard_idx,
+                "total_tokens": total_tokens,
+                "docs_processed": docs_processed,
+                "tokens_per_shard": tokens_per_shard,
+                "vocab_size": 50257,
+                "tokenizer": "tiktoken-gpt2",
+            }, f, indent=2)
+
+        elapsed = time.time() - t0
+        print(f"\nDone! {total_tokens:,} tokens in {shard_idx} shards ({elapsed / 60:.1f} min)")
+        return
 
     print(f"Downloading {name} ({path})...")
     print(f"Description: {info['description']}")
@@ -173,7 +349,6 @@ def download(name, out_dir=None, shard_limit=None):
     except RuntimeError as e:
         if "Dataset scripts are no longer supported" in str(e):
             print("Dataset script not supported. Falling back to snapshot_download...")
-            from huggingface_hub import snapshot_download
             snapshot_download(repo_id=path, repo_type="dataset", local_dir=str(out_dir))
             print(f"  Downloaded raw repository to {out_dir}")
         else:
@@ -192,6 +367,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, help="Name of the dataset to download")
     parser.add_argument("--out-dir", type=str, default=None, help="Output directory")
     parser.add_argument("--shards", type=int, default=None, help="Number of shards to download (if supported)")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Stop after this many tokens (tokenized only)")
+    parser.add_argument("--tokens-per-shard", type=int, default=None, help="Tokens per shard file (tokenized only)")
     parser.add_argument("--list", action="store_true", help="List all available datasets")
     
     args = parser.parse_args()
@@ -199,6 +376,12 @@ if __name__ == "__main__":
     if args.list:
         list_datasets()
     elif args.dataset:
-        download(args.dataset, args.out_dir, shard_limit=args.shards)
+        download(
+            args.dataset, 
+            args.out_dir, 
+            shard_limit=args.shards, 
+            max_tokens=args.max_tokens, 
+            tokens_per_shard=args.tokens_per_shard
+        )
     else:
         parser.print_help()

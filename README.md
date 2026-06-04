@@ -29,9 +29,6 @@ source onix_env/bin/activate
 Install all required libraries. The `requirements.txt` is pre-configured with the PyTorch ROCm index URL, so this single command will automatically fetch the ROCm-optimized PyTorch packages along with all data processing, tokenization, and web GUI tools:
 
 ```bash
-# Upgrade pip to ensure smooth wheel builds
-pip install --upgrade pip
-
 # Install dependencies
 pip install -r requirements.txt
 ```
@@ -40,12 +37,19 @@ pip install -r requirements.txt
 
 ## 🚀 Quick Start
 
-The framework uses a unified `.sh` tracking structure. Depending on the modality, simply refer to a pre-defined architecture preset or a custom JSON config. Ensure your virtual environment is active (`source onix_env/bin/activate`) before running any scripts.
+The project provides helper shell scripts (`./run_train.sh` and `./run_finetune.sh`) to easily launch and manage background training jobs. To train a model, you configure its architecture using either a pre-defined preset name or a custom JSON configuration file.
 
 **A. Standard Text LLMs**
-Run standard transformer training optimized for memory via 8-bit `adamw` bitsandbytes implementations.
+Run decoder-only transformer training optimized for high performance and low memory footprint.
+
+*Example: Optimized LLaMA 1B pre-training (uses 512 context, gradient checkpointing, `bf16` mixed precision, and `torch.compile` kernel fusion)*
 ```bash
-./run_train.sh my-gpt --mode llm --model-size 124M --data ../the-verdict.txt
+./run_train.sh my-llama \
+    --mode llm \
+    --config configs/llama1b_512_opt.json \
+    --data ../the-verdict.txt \
+    --bf16 \
+    --compile
 ```
 
 **B. Vision Models (VQ-VAE)**
@@ -84,8 +88,8 @@ For more detailed guides regarding dataset manipulation, large scale dataset sha
    - Handling Auto-Resumption and continuous Fast-forwarding
    - Checkpoint retention logic and 8-bit memory optimizations
 
-## 🧠 Core Package Features
-The core intelligence for model routing lies in the `architecture/` code:
-- `config.py`: The validation schema handling the diverse parameters.
-- `layers.py`: Grouped Query Attentions, KV heads, and Positional Encodings (ALiBi/RoPE).
-- `model.py`: Fast `CausalLM` assembly and recursive modular abstractions.
+## 📖 Example: Training a Model on TinyStories
+
+For a complete, step-by-step walkthrough on how to prepare the TinyStories dataset, configure the LLaMA 1B architecture, and launch optimized pre-training on your system, please refer to our dedicated guide:
+
+- [**Training LLaMA 1B on TinyStories (`docs/training_llama1b_on_tinystories.md`)**](docs/training_llama1b_on_tinystories.md)

@@ -10,14 +10,14 @@ We support an advanced sharded tokenization pipeline that memory-maps massive se
 This pulls from HuggingFace, tokenizes the data locally, and saves it as pure binary arrays (`.npy`):
 
 ```bash
-# General downloader usage
-python -m pretrain_data.download --list
+# General downloader usage (displays SFT, Vision, and Pretraining datasets)
+python download_hf.py --list
 
-# Download TinyStories for quick testing
-python -m pretrain_data.download --dataset tiny-stories
+# Download TinyStories for quick testing (pre-tokenized into shards)
+python download_hf.py --dataset tiny-stories
 
-# Download FineWeb-Edu 10B token sample (default)
-python -m pretrain_data.download
+# Download FineWeb-Edu 10B token sample
+python download_hf.py --dataset fineweb-edu-10bt
 ```
 
 ## 2. Text Fine-tuning Data (SFT)
