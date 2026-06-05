@@ -335,7 +335,7 @@ def download(name, out_dir=None, shard_limit=None, max_tokens=None, tokens_per_s
 
     # Standard download
     try:
-        ds = load_dataset(path, name=config_name, trust_remote_code=True)
+        ds = load_dataset(path, name=config_name)
         print(f"Saving to {out_dir}...")
         # Save as JSONL for SFT or arrow/parquet for others
         if info["type"] == "sft":

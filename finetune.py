@@ -418,7 +418,7 @@ def main():
         write_status("DATA: Utilizing VRAM for dataset storage. DataLoader workers set to 0.")
 
     collate = partial(instruction_collate_fn, device=device if use_gpu_data else "cpu", 
-                      allowed_max_length=1024)
+                      allowed_max_length=model.config.context_length)
     
     train_loader = DataLoader(InstructionDataset(all_tokens_tensor, train_bounds),
                               batch_size=tp["batch_size"], collate_fn=collate,
