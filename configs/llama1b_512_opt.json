@@ -1,7 +1,7 @@
 {
-    "name": "llama-1b-8192",
+    "name": "llama-1b-512-opt",
     "vocab_size": 50257,
-    "context_length": 8192,
+    "context_length": 512,
     "emb_dim": 2048,
     "n_layers": 22,
     "n_heads": 32,
@@ -19,7 +19,7 @@
     "ffn_bias": false,
     "ffn_dropout": 0.0,
     "block_type": "sequential",
-    "grad_checkpointing": true,
+    "grad_checkpointing": false,
     "tie_embeddings": true,
     "emb_dropout": 0.0,
     "residual_dropout": 0.0
