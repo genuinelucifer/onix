@@ -58,9 +58,9 @@ Run the launch script:
     --batch-size 32 \
     --epochs 1 \
     --log-freq 10 \
-    --save-iters 10 \
+    --save-iters 1000 \
     --save-limit 1 \
-    --eval-freq 10 \
+    --eval-freq 1000 \
     --num-workers 2 \
     --prefetch-factor 4
 ```
@@ -155,9 +155,9 @@ Run the SFT script using the `./run_finetune.sh` background launcher script:
     --epochs 1 \
     --lr 5e-5 \
     --log-freq 10 \
-    --save-iters 100 \
+    --save-iters 1000 \
     --save-limit 1 \
-    --eval-freq 500
+    --eval-freq 1000
 ```
 
 #### New SFT-Specific Flags:
