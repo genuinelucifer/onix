@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Instruction Fine-Tuning Script (SFT)
+Onix Instruction Fine-Tuning Script (SFT)
 Fine-tune a pretrained GPT-2 model on Alpaca-style instruction data.
 
 New run:
@@ -238,7 +238,7 @@ def train_sft(model, train_loader, val_loader, optimizer, device,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YALLM Instruction Fine-Tune",
+        description="Onix Instruction Fine-Tune",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_common_training_args(parser)

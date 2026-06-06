@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Multi-Modal LLM Training Script (Phase 2)
+Onix Multi-Modal LLM Training Script (Phase 2)
 
 Train a decoder-only transformer to generate visual tokens from text prompts.
 Uses a frozen VQ-VAE (trained in Phase 1) as the image tokenizer.
@@ -248,7 +248,7 @@ def train_multimodal_loop(model, train_loader, val_loader, optimizer, device,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YALLM Multi-Modal LLM Training (Phase 2)",
+        description="Onix Multi-Modal LLM Training (Phase 2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Common training args

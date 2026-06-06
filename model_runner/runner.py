@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Model Runner — load trained YALLM checkpoints and run inference.
+Model Runner — load trained Onix checkpoints and run inference.
 
 Supports three model types:
   - vqvae:      Image reconstruction (encode → decode)

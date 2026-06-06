@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Unified Training Dispatcher
+Onix Unified Training Dispatcher
 
 Routes training to the appropriate script based on mode:
   --mode llm          → train_llm.py    (text-only decoder transformer)

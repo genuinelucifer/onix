@@ -1,6 +1,6 @@
-# YALLM Datasets Guide
+# Onix Datasets Guide
 
-YALLM utilizes tailored pipelines for different types of modalities and training processes to ensure maximum throughput and minimum memory usage.
+Onix utilizes tailored pipelines for different types of modalities and training processes to ensure maximum throughput and minimum memory usage.
 
 ## 1. Text Pretraining Datasets
 

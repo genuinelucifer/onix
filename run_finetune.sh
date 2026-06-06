@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run YALLM instruction fine-tuning in the background.
+# Run Onix instruction fine-tuning in the background.
 #
 # Usage:
 #   ./run_finetune.sh my-sft --data instruction-data.json
@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate venv (lives in parent yallm/ dir)
+# Activate venv (lives in parent onix/ dir)
 if [ -d "onix_env" ]; then
     source onix_env/bin/activate
 else

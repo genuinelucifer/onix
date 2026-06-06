@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM VQ-VAE Pretraining Script (Phase 1)
+Onix VQ-VAE Pretraining Script (Phase 1)
 
 Train a VQ-VAE to compress and reconstruct images using a discrete codebook.
 Once trained, the VQ-VAE is frozen and used as an image tokenizer for
@@ -287,7 +287,7 @@ def train_vqvae_loop(model, train_loader, val_loader, optimizer, device,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YALLM VQ-VAE Pretraining (Phase 1)",
+        description="Onix VQ-VAE Pretraining (Phase 1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Common training args

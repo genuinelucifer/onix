@@ -1,6 +1,6 @@
-# YALLM Training Guide
+# Onix Training Guide
 
-YALLM supports configurable architectures and automatically routes the unified logic under `train.py` to target the correct modality.
+Onix supports configurable architectures and automatically routes the unified logic under `train.py` to target the correct modality.
 
 ## Modality Dispatcher
 The `train.py` dispatcher routes to:
@@ -77,11 +77,11 @@ Instead of struggling to find background PIDs, cleanly terminate a model's run u
 ```
 
 ### Resuming Work
-YALLM remembers your state and fast-forwards the dataloaders back to exactly the iteration where you stopped. The `train.py` dispatcher will automatically realize which `--mode` you were in.
+Onix remembers your state and fast-forwards the dataloaders back to exactly the iteration where you stopped. The `train.py` dispatcher will automatically realize which `--mode` you were in.
 ```bash
 ./run_train.sh <model_name> --resume
 ```
 
 ## Checkpoint Retention & Settings
 - **Retention**: To save extreme disk space, `train.py` automatically maintains only the **last 3 checkpoints** and deletes older ones automatically.
-- Ensure your `YALLM_MODELS_DIR` environment variable is linked to a heavy-capacity drive if training massively scaled variants.
+- Ensure your `ONIX_MODELS_DIR` (or `YALLM_MODELS_DIR`) environment variable is linked to a heavy-capacity drive if training massively scaled variants.

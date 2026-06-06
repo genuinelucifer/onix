@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Model Runner — Interactive UI for testing trained models.
+Onix Model Runner — Interactive UI for testing trained models.
 
 Supports:
   - VQ-VAE: Upload image → see reconstruction quality
@@ -402,13 +402,13 @@ def create_ui():
     """Build and return the Gradio Blocks app."""
 
     with gr.Blocks(
-        title="YALLM Model Runner",
+        title="Onix Model Runner",
     ) as app:
 
         # ---- Header ----
         gr.Markdown(
             """
-            # 🧪 YALLM Model Runner
+            # 🧪 Onix Model Runner
             Load and test your trained models — VQ-VAE reconstruction,
             text-to-image generation, or LLM chat.
             """,
@@ -685,7 +685,7 @@ def create_ui():
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="YALLM Model Runner")
+    parser = argparse.ArgumentParser(description="Onix Model Runner")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--share", action="store_true",

@@ -1,8 +1,8 @@
 # ==============================================================================
-# YALLM (Yet Another LLaMA Model) - Project Dependencies
+# Onix - Project Dependencies
 # ==============================================================================
 # This file lists the external Python packages required to run, pretrain,
-# fine-tune, and deploy models in the YALLM project.
+# fine-tune, and deploy models in the Onix project.
 #
 # Hardware-agnostic version bounds are specified below. 
 # Comments show the exact ROCm-optimized versions running in the current system.

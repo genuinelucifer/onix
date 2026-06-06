@@ -1,6 +1,6 @@
-# YALLM Pretraining & Architecture Suite
+# Onix Pretraining & Architecture Suite
 
-YALLM is a comprehensive, high-performance training suite designed for building modern text-only transformers (GPT-2, LLaMA, Mistral, etc.) and autoregressive generative image models (VQ-VAE tokenizers + Multimodal generation).
+Onix is a comprehensive, high-performance training suite designed for building modern text-only transformers (GPT-2, LLaMA, Mistral, etc.) and autoregressive generative image models (VQ-VAE tokenizers + Multimodal generation).
 
 ## 🛠️ Developer Setup
 
@@ -93,3 +93,7 @@ For more detailed guides regarding dataset manipulation, large scale dataset sha
 For a complete, step-by-step walkthrough on how to prepare the TinyStories dataset, configure the LLaMA 1B architecture, and launch optimized pre-training on your system, please refer to our dedicated guide:
 
 - [**Training LLaMA 1B on TinyStories (`docs/training_llama1b_on_tinystories.md`)**](docs/training_llama1b_on_tinystories.md)
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

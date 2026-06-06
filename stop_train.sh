@@ -3,7 +3,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="${YALLM_MODELS_DIR:-$SCRIPT_DIR/models}"
+MODELS_DIR="$SCRIPT_DIR/models"
 
 MODEL_NAME="${1:?Usage: $0 <model_name>}"
 PID_FILE="$MODELS_DIR/$MODEL_NAME/.pid"

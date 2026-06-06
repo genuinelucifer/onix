@@ -1,5 +1,5 @@
 """
-YALLM Architecture Module
+Onix Architecture Module
 Expressive, config-driven transformer architectures for pretraining 1B–4B models.
 Supports both text-only LLMs and multi-modal VQ-VAE + autoregressive pipelines.
 """

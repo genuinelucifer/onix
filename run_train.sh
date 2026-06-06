@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run YALLM training in the background.
+# Run Onix training in the background.
 #
 # LLM:        ./run_train.sh my-llama --mode llm --preset llama-1b
 # LLM Config: ./run_train.sh my-model --mode llm --config configs/custom.json

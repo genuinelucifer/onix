@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Shared Utilities
+Onix Shared Utilities
 Contains directory helpers, status logging, checkpointing, and tokenizer helpers.
 """
 
@@ -16,7 +16,7 @@ import torch.nn as nn
 EOT_TOKEN = "<" + "|endoftext|" + ">"
 EOT_TOKEN_ID = 50256
 
-MODELS_DIR = Path(os.environ.get("YALLM_MODELS_DIR", Path(__file__).parent / "models"))
+MODELS_DIR = Path(os.environ.get("ONIX_MODELS_DIR", os.environ.get("YALLM_MODELS_DIR", Path(__file__).parent / "models")))
 
 
 # ===========================================================================

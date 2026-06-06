@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Pretraining Script
+Onix Pretraining Script
 Train any decoder-only transformer from scratch.
 
 Supports:
@@ -237,7 +237,7 @@ def create_model_from_config(config: ModelConfig, device: torch.device) -> Causa
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YALLM Pretrain",
+        description="Onix Pretrain",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Common training args (model-name, config, resume, epochs, lr, etc.)
@@ -301,7 +301,7 @@ def main():
         else:
             raise ValueError(
                 "This trainer no longer supports legacy GPT2 class models. "
-                "Please use a previous version of YALLM or convert the state_dict."
+                "Please use a previous version of Onix or convert the state_dict."
             )
 
         if not checkpoint_exists:

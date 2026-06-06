@@ -1,4 +1,4 @@
-# YALLM Instruction Fine-Tuning Pipeline
+# Onix Instruction Fine-Tuning Pipeline
 
 This document details the pipeline used to instruction fine-tune a base LLM using the `TinyStoriesInstruct` dataset.
 

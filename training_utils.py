@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YALLM Shared Training Utilities
+Onix Shared Training Utilities
 
 Consolidates common boilerplate used across train_llm.py, train_multimodal.py,
 and train_vqvae.py:
