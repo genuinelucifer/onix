@@ -337,8 +337,40 @@ def llm_user_add(message, chat_history):
     return gr.update(value="", interactive=False), chat_history
 
 
+def make_tps_html(tps: float | None) -> str:
+    if tps is None:
+        return """
+        <div style='background-color: #f8fafc; padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #e2e8f0;'>
+          <div style='font-size: 11px; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;'>Decode Speed</div>
+          <div style='font-size: 20px; font-weight: bold; color: #334155; margin-top: 4px;'>-- tk/sec</div>
+        </div>
+        """
+    return f"""
+    <div style='background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #bbf7d0;'>
+      <div style='font-size: 11px; color: #166534; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;'>Decode Speed</div>
+      <div style='font-size: 20px; font-weight: bold; color: #14532d; margin-top: 4px;'>{tps:.1f} tk/sec</div>
+    </div>
+    """
+
+
+def make_ttft_html(ttft_ms: float | None) -> str:
+    if ttft_ms is None:
+        return """
+        <div style='background-color: #f8fafc; padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #e2e8f0;'>
+          <div style='font-size: 11px; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;'>Prefill (TTFT)</div>
+          <div style='font-size: 20px; font-weight: bold; color: #334155; margin-top: 4px;'>-- ms</div>
+        </div>
+        """
+    return f"""
+    <div style='background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #bae6fd;'>
+      <div style='font-size: 11px; color: #075985; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;'>Prefill (TTFT)</div>
+      <div style='font-size: 20px; font-weight: bold; color: #0c4a6e; margin-top: 4px;'>{ttft_ms:.0f} ms</div>
+    </div>
+    """
+
+
 def llm_bot_gen(chat_history, temperature, top_k, top_p,
-                max_new_tokens, repetition_penalty):
+                max_new_tokens, repetition_penalty, use_kv_cache):
     """Actually run inference and add the bot's response bubble."""
     if _loaded_model is None or _loaded_model.model_type != "llm":
         chat_history = chat_history or []
@@ -346,10 +378,10 @@ def llm_bot_gen(chat_history, temperature, top_k, top_p,
             "role": "assistant", 
             "content": "⚠️ No LLM model loaded. Please load a model first."
         })
-        return chat_history, gr.update(interactive=True)
+        return chat_history, gr.update(interactive=True), make_tps_html(None), make_ttft_html(None)
 
     if not chat_history:
-        return chat_history, gr.update(interactive=True)
+        return chat_history, gr.update(interactive=True), make_tps_html(None), make_ttft_html(None)
 
     # Build conversation text
     conv_text = ""
@@ -378,20 +410,30 @@ def llm_bot_gen(chat_history, temperature, top_k, top_p,
         top_k=int(top_k) if top_k else None,
         top_p=top_p if top_p and top_p < 1.0 else None,
         repetition_penalty=repetition_penalty,
+        use_kv_cache=use_kv_cache,
     )
 
+    tps_val, ttft_val = None, None
     try:
-        response = run_llm_inference(_loaded_model, conv_text, params)
+        res = run_llm_inference(_loaded_model, conv_text, params)
+        response = res["text"]
+        tokens = res["tokens"]
+        ttft = res["ttft"]
+        decode_time = res["decode_time"]
+        
+        decode_tokens = max(0, tokens - 1)
+        tps_val = decode_tokens / decode_time if decode_time > 0 else 0.0
+        ttft_val = ttft * 1000
         chat_history.append({"role": "assistant", "content": response})
     except Exception as e:
         chat_history.append({"role": "assistant", "content": f"⚠️ Generation error: {e}"})
 
-    return chat_history, gr.update(interactive=True)
+    return chat_history, gr.update(interactive=True), make_tps_html(tps_val), make_ttft_html(ttft_val)
 
 
 def clear_chat():
     """Clear chat history."""
-    return [], ""
+    return [], "", make_tps_html(None), make_ttft_html(None)
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +585,8 @@ def create_ui():
                         chat_send = gr.Button(
                             "Send", variant="primary", scale=1
                         )
-                    chat_clear = gr.Button("🗑️ Clear Chat", size="sm")
+                    with gr.Row():
+                        chat_clear = gr.Button("🗑️ Clear Chat", size="sm")
 
                 with gr.Column(scale=1):
                     gr.Markdown("**Generation Settings**")
@@ -567,6 +610,15 @@ def create_ui():
                         1.0, 2.0, value=1.1, step=0.05,
                         label="Repetition Penalty",
                     )
+                    llm_use_kv_cache = gr.Checkbox(
+                        value=True,
+                        label="Use KV Cache",
+                    )
+                    gr.Markdown("---")
+                    gr.Markdown("**Performance Metrics**")
+                    with gr.Row():
+                        llm_tps_output = gr.HTML(value=make_tps_html(None))
+                        llm_ttft_output = gr.HTML(value=make_ttft_html(None))
 
         # ---- Event bindings ----
 
@@ -653,8 +705,8 @@ def create_ui():
             show_progress="minimal",
         ).then(
             fn=llm_bot_gen,
-            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty],
-            outputs=[chatbot, chat_input],
+            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty, llm_use_kv_cache],
+            outputs=[chatbot, chat_input, llm_tps_output, llm_ttft_output],
             show_progress="minimal",
         )
         chat_input.submit(
@@ -664,14 +716,20 @@ def create_ui():
             show_progress="minimal",
         ).then(
             fn=llm_bot_gen,
-            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty],
-            outputs=[chatbot, chat_input],
+            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty, llm_use_kv_cache],
+            outputs=[chatbot, chat_input, llm_tps_output, llm_ttft_output],
             show_progress="minimal",
         )
         
         chat_clear.click(
             fn=clear_chat,
-            outputs=[chatbot, chat_input],
+            outputs=[chatbot, chat_input, llm_tps_output, llm_ttft_output],
+            show_progress="minimal",
+        )
+
+        chatbot.clear(
+            fn=clear_chat,
+            outputs=[chatbot, chat_input, llm_tps_output, llm_ttft_output],
             show_progress="minimal",
         )
 

@@ -64,6 +64,7 @@ class GenerationParams:
     top_p: Optional[float] = 0.9
     repetition_penalty: float = 1.1
     eos_id: Optional[int] = None
+    use_kv_cache: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +381,7 @@ def run_llm_inference(
     loaded: LoadedModel,
     conversation_text: str,
     params: GenerationParams,
-) -> str:
+) -> dict:
     """
     Generate text continuation from the conversation so far.
 
@@ -390,7 +391,10 @@ def run_llm_inference(
         params: Generation parameters
 
     Returns:
-        Generated text (new tokens only, not the input)
+        A dict containing:
+          - "text": generated text
+          - "tokens": number of tokens generated
+          - "time": duration of generation in seconds
     """
     assert loaded.model_type == "llm"
 
@@ -409,6 +413,7 @@ def run_llm_inference(
     input_len = input_ids.shape[1]
 
     # Generate
+    metrics = {}
     with torch.no_grad():
         output_ids = generate(
             model=model,
@@ -420,13 +425,20 @@ def run_llm_inference(
             top_p=params.top_p,
             repetition_penalty=params.repetition_penalty,
             eos_id=params.eos_id if params.eos_id is not None else EOT_TOKEN_ID,
+            use_kv_cache=params.use_kv_cache,
+            metrics=metrics,
         )
 
     # Extract only the new tokens
     new_tokens = output_ids[:, input_len:]
     generated_text = token_ids_to_text(new_tokens, tokenizer)
 
-    return generated_text
+    return {
+        "text": generated_text,
+        "tokens": new_tokens.shape[1],
+        "ttft": metrics.get("ttft", 0.0),
+        "decode_time": metrics.get("decode_time", 0.0),
+    }
 
 
 # ---------------------------------------------------------------------------
