@@ -85,11 +85,20 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, seq_len: int):
-        if seq_len > self.max_seq_len:
-            self._build_cache(seq_len)
-            self.max_seq_len = seq_len
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, position_ids_or_len: torch.Tensor | int):
+        if isinstance(position_ids_or_len, int):
+            seq_len = position_ids_or_len
+            if seq_len > self.max_seq_len:
+                self._build_cache(seq_len)
+                self.max_seq_len = seq_len
+            return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+        position_ids = position_ids_or_len
+        max_pos = position_ids.max().item()
+        if max_pos >= self.max_seq_len:
+            self._build_cache(int(max_pos) + 1)
+            self.max_seq_len = int(max_pos) + 1
+        return self.cos_cached[position_ids], self.sin_cached[position_ids]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -105,10 +114,14 @@ def apply_rotary_pos_emb(
     """
     Apply RoPE to query and key tensors.
     q, k: (batch, heads, seq, head_dim)
-    cos, sin: (seq, head_dim)
+    cos, sin: (seq, head_dim) or (batch, seq, head_dim)
     """
-    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq, head_dim)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq, head_dim)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    else:
+        cos = cos.unsqueeze(1)  # (batch, 1, seq, head_dim)
+        sin = sin.unsqueeze(1)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
@@ -227,7 +240,13 @@ class GroupedQueryAttention(nn.Module):
             .reshape(B, self.n_heads, T, D)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         # Project
@@ -237,45 +256,62 @@ class GroupedQueryAttention(nn.Module):
 
         # Apply RoPE
         if self.pos_encoding_type == "rope":
-            cos, sin = self.rotary(T)
+            if position_ids is None:
+                position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+            cos, sin = self.rotary(position_ids)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
+        # Concatenate keys and values with past caches if present
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
+
+        # Save the new cache if requested
+        new_kv_cache = (k, v) if use_cache else None
+
+        # Total key/value sequence length
+        S = k.shape[-2]
+
         # Expand KV for GQA
-        k = self._repeat_kv(k)
-        v = self._repeat_kv(v)
+        k_for_attn = self._repeat_kv(k)
+        v_for_attn = self._repeat_kv(v)
 
         # Compute attention
         if self._use_sdpa:
             dropout_p = self.attn_dropout_p if self.training else 0.0
+            is_causal = (T > 1)
             out = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, dropout_p=dropout_p,
+                q, k_for_attn, v_for_attn, is_causal=is_causal, dropout_p=dropout_p,
             )
         else:
             # Manual attention path (needed for ALiBi, sliding window)
-            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = (q @ k_for_attn.transpose(-2, -1)) * self.scale
 
             # ALiBi bias
             if self.pos_encoding_type == "alibi":
-                attn = attn + self.alibi(T)
+                bias = self.alibi(S)
+                attn = attn + bias[:, -T:, :S]
 
             # Causal mask
-            attn = attn.masked_fill(self.causal_mask[:T, :T], float("-inf"))
+            if T > 1:
+                attn = attn.masked_fill(self.causal_mask[:T, :S], float("-inf"))
 
             # Sliding window mask
             if self.sliding_window is not None:
-                positions = torch.arange(T, device=x.device)
-                # distance[i,j] = i - j;  mask where distance >= window
-                dist = positions.unsqueeze(1) - positions.unsqueeze(0)
+                q_pos = torch.arange(S - T, S, device=x.device)
+                k_pos = torch.arange(S, device=x.device)
+                dist = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
                 window_mask = dist >= self.sliding_window
                 attn = attn.masked_fill(window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
-            out = attn @ v
+            out = attn @ v_for_attn
 
         # Output projection
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.o_proj(out)
+        return self.o_proj(out), new_kv_cache
 
 
 # ===========================================================================

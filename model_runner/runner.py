@@ -131,6 +131,8 @@ def load_model(
     checkpoint_path: str,
     device: str = "cuda",
     config_path: Optional[str] = None,
+    dtype: Optional[torch.dtype] = None,
+    compile: bool = False,
 ) -> LoadedModel:
     """
     Load a model from a checkpoint file or model directory.
@@ -140,6 +142,9 @@ def load_model(
     Args:
         checkpoint_path: Path to a .pt file OR a model directory
         device: Device to load onto ("cuda", "cpu", etc.)
+        config_path: Optional manual path to config.json
+        dtype: Optional torch.dtype to cast model weights to
+        compile: Whether to run torch.compile on the model
 
     Returns:
         LoadedModel with the model ready for inference
@@ -161,11 +166,11 @@ def load_model(
     tokenizer = get_tokenizer()
 
     if model_type == "vqvae":
-        return _load_vqvae(ckpt_path, full_config, dev, tokenizer)
+        return _load_vqvae(ckpt_path, full_config, dev, tokenizer, dtype, compile)
     elif model_type == "multimodal":
-        return _load_multimodal(ckpt_path, full_config, dev, tokenizer)
+        return _load_multimodal(ckpt_path, full_config, dev, tokenizer, dtype, compile)
     elif model_type == "llm":
-        return _load_llm(ckpt_path, full_config, dev, tokenizer)
+        return _load_llm(ckpt_path, full_config, dev, tokenizer, dtype, compile)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -179,7 +184,8 @@ def _strip_orig_mod_prefix(state_dict: dict) -> dict:
 
 
 def _load_vqvae(
-    ckpt_path: Path, config: dict, device: torch.device, tokenizer
+    ckpt_path: Path, config: dict, device: torch.device, tokenizer,
+    dtype: Optional[torch.dtype] = None, compile: bool = False,
 ) -> LoadedModel:
     """Load a VQ-VAE model."""
     vqvae_config = VQVAEConfig.from_dict(config["vqvae"])
@@ -192,6 +198,12 @@ def _load_vqvae(
     del ckpt
 
     model.load_state_dict(state_dict, strict=False)
+
+    if dtype is not None:
+        model = model.to(dtype)
+
+    if compile:
+        model = torch.compile(model)
 
     model.eval()
 
@@ -207,7 +219,8 @@ def _load_vqvae(
 
 
 def _load_multimodal(
-    ckpt_path: Path, config: dict, device: torch.device, tokenizer
+    ckpt_path: Path, config: dict, device: torch.device, tokenizer,
+    dtype: Optional[torch.dtype] = None, compile: bool = False,
 ) -> LoadedModel:
     """Load a multimodal model (transformer + frozen VQ-VAE)."""
     mm_config = MultiModalConfig.from_dict(config["multimodal"])
@@ -223,8 +236,6 @@ def _load_multimodal(
     del ckpt
 
     model.load_state_dict(state_dict, strict=False)
-
-    model.eval()
 
     # Load frozen VQ-VAE for decoding
     vqvae_ckpt_path = mm_config.vqvae_checkpoint
@@ -243,6 +254,16 @@ def _load_multimodal(
 
         frozen_vqvae.load_state_dict(vq_state_dict, strict=False)
 
+    if dtype is not None:
+        model = model.to(dtype)
+        if frozen_vqvae is not None:
+            frozen_vqvae = frozen_vqvae.to(dtype)
+
+    if compile:
+        model = torch.compile(model)
+
+    model.eval()
+    if frozen_vqvae is not None:
         frozen_vqvae.eval()
         for p in frozen_vqvae.parameters():
             p.requires_grad_(False)
@@ -261,7 +282,8 @@ def _load_multimodal(
 
 
 def _load_llm(
-    ckpt_path: Path, config: dict, device: torch.device, tokenizer
+    ckpt_path: Path, config: dict, device: torch.device, tokenizer,
+    dtype: Optional[torch.dtype] = None, compile: bool = False,
 ) -> LoadedModel:
     """Load an LLM (CausalLM) model."""
     model_config = ModelConfig.from_dict(config["architecture"])
@@ -279,6 +301,12 @@ def _load_llm(
     del ckpt
 
     model.load_state_dict(state_dict, strict=False)
+
+    if dtype is not None:
+        model = model.to(dtype)
+
+    if compile:
+        model = torch.compile(model)
 
     model.eval()
 

@@ -5,7 +5,7 @@ Assembles layers from config into a complete decoder-only transformer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -35,17 +35,44 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward(config)
         self.resid_dropout = nn.Dropout(config.residual_dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        new_cache = None
         if self.block_type == "parallel":
             # GPT-J style: attention and FFN computed in parallel
             normed = self.attn_norm(x)
-            attn_out = self.attn(normed)
+            if use_cache or kv_cache is not None:
+                attn_out, new_cache = self.attn(
+                    normed,
+                    position_ids=position_ids,
+                    kv_cache=kv_cache,
+                    use_cache=use_cache,
+                )
+            else:
+                attn_out, _ = self.attn(normed, position_ids=position_ids, use_cache=False)
             ffn_out = self.ffn(self.ffn_norm(x))
             x = x + self.resid_dropout(attn_out + ffn_out)
         else:
             # Standard sequential: Attn then FFN
-            x = x + self.resid_dropout(self.attn(self.attn_norm(x)))
+            if use_cache or kv_cache is not None:
+                attn_out, new_cache = self.attn(
+                    self.attn_norm(x),
+                    position_ids=position_ids,
+                    kv_cache=kv_cache,
+                    use_cache=use_cache,
+                )
+            else:
+                attn_out, _ = self.attn(self.attn_norm(x), position_ids=position_ids, use_cache=False)
+            x = x + self.resid_dropout(attn_out)
             x = x + self.resid_dropout(self.ffn(self.ffn_norm(x)))
+
+        if use_cache:
+            return x, new_cache
         return x
 
 
@@ -98,12 +125,21 @@ class CausalLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        idx: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             idx: (batch, seq_len) token indices
+            position_ids: (batch, seq_len) position indices
+            kv_caches: list of cached (key, value) tuples per block
+            use_cache: whether to compute and return new KV caches
         Returns:
-            logits: (batch, seq_len, vocab_size)
+            logits if use_cache is False, else (logits, new_kv_caches)
         """
         B, T = idx.shape
 
@@ -112,22 +148,41 @@ class CausalLM(nn.Module):
 
         # Add learned position embeddings if configured
         if self.pos_emb is not None:
-            positions = torch.arange(T, device=idx.device)
-            x = x + self.pos_emb(positions)
+            if position_ids is not None:
+                x = x + self.pos_emb(position_ids)
+            else:
+                positions = torch.arange(T, device=idx.device)
+                x = x + self.pos_emb(positions)
 
         x = self.emb_dropout(x)
 
         # Transformer blocks
-        for block in self.blocks:
-            if self.config.grad_checkpointing and self.training:
-                # use_reentrant=False is generally preferred in newer PyTorch
-                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+        new_kv_caches = [] if use_cache else None
+        for i, block in enumerate(self.blocks):
+            block_cache = kv_caches[i] if kv_caches is not None else None
+
+            if use_cache or block_cache is not None:
+                x, new_cache = block(
+                    x,
+                    position_ids=position_ids,
+                    kv_cache=block_cache,
+                    use_cache=use_cache,
+                )
+                if use_cache:
+                    new_kv_caches.append(new_cache)
             else:
-                x = block(x)
+                if self.config.grad_checkpointing and self.training:
+                    # use_reentrant=False is generally preferred in newer PyTorch
+                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                else:
+                    x = block(x)
 
         # Final norm + LM head
         x = self.final_norm(x)
         logits = self.lm_head(x)
+
+        if use_cache:
+            return logits, new_kv_caches
         return logits
 
     def param_count(self) -> int:

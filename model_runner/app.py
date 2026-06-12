@@ -208,7 +208,7 @@ def pick_config_path():
         print(f"File dialog error: {e}")
         return ""
 
-def load_model_handler(checkpoint_path: str, device: str, config_path: str):
+def load_model_handler(checkpoint_path: str, device: str, config_path: str, precision: str, compile_model: bool):
     """Handle model loading from the UI."""
     global _loaded_model, _conversation_history
 
@@ -224,8 +224,23 @@ def load_model_handler(checkpoint_path: str, device: str, config_path: str):
     checkpoint_path = checkpoint_path.strip()
     config_path = config_path.strip() if config_path else None
 
+    # Map precision string to torch.dtype
+    dtype = None
+    if precision == "bfloat16":
+        dtype = torch.bfloat16
+    elif precision == "float16":
+        dtype = torch.float16
+    elif precision == "float32":
+        dtype = torch.float32
+
     try:
-        _loaded_model = load_model(checkpoint_path, device=device, config_path=config_path)
+        _loaded_model = load_model(
+            checkpoint_path,
+            device=device,
+            config_path=config_path,
+            dtype=dtype,
+            compile=compile_model,
+        )
         _conversation_history = []
 
         info = get_model_info(_loaded_model)
@@ -487,6 +502,19 @@ def create_ui():
                     interactive=True,
                     scale=2,
                 )
+                precision_dropdown = gr.Dropdown(
+                    label="Precision Mode",
+                    choices=["float32", "bfloat16", "float16"],
+                    value="float32",
+                    interactive=True,
+                    scale=2,
+                )
+                compile_checkbox = gr.Checkbox(
+                    label="Compile Model",
+                    value=False,
+                    interactive=True,
+                    scale=2,
+                )
                 load_btn = gr.Button("🔄 Load", variant="primary", scale=1)
                 unload_btn = gr.Button("🗑️ Unload", variant="stop", scale=1)
 
@@ -590,30 +618,31 @@ def create_ui():
 
                 with gr.Column(scale=1):
                     gr.Markdown("**Generation Settings**")
-                    llm_temp = gr.Slider(
-                        0.0, 2.0, value=0.8, step=0.05,
-                        label="Temperature",
-                    )
-                    llm_topk = gr.Slider(
-                        0, 500, value=50, step=1,
-                        label="Top-K (0=off)",
-                    )
-                    llm_topp = gr.Slider(
-                        0.0, 1.0, value=0.9, step=0.05,
-                        label="Top-P",
-                    )
-                    llm_max_tokens = gr.Slider(
-                        10, 2000, value=200, step=10,
-                        label="Max New Tokens",
-                    )
-                    llm_rep_penalty = gr.Slider(
-                        1.0, 2.0, value=1.1, step=0.05,
-                        label="Repetition Penalty",
-                    )
                     llm_use_kv_cache = gr.Checkbox(
                         value=True,
                         label="Use KV Cache",
                     )
+                    with gr.Accordion("Text Generation Parameters", open=False):
+                        llm_temp = gr.Slider(
+                            0.0, 2.0, value=0.8, step=0.05,
+                            label="Temperature",
+                        )
+                        llm_topk = gr.Slider(
+                            0, 500, value=50, step=1,
+                            label="Top-K (0=off)",
+                        )
+                        llm_topp = gr.Slider(
+                            0.0, 1.0, value=0.9, step=0.05,
+                            label="Top-P",
+                        )
+                        llm_max_tokens = gr.Slider(
+                            10, 2000, value=200, step=10,
+                            label="Max New Tokens",
+                        )
+                        llm_rep_penalty = gr.Slider(
+                            1.0, 2.0, value=1.1, step=0.05,
+                            label="Repetition Penalty",
+                        )
                     gr.Markdown("---")
                     gr.Markdown("**Performance Metrics**")
                     with gr.Row():
@@ -639,7 +668,7 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input],
+            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox],
             outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
             show_progress="hidden",
         ).then(
@@ -651,7 +680,7 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input],
+            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox],
             outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
             show_progress="hidden",
         ).then(
@@ -662,7 +691,7 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input],
+            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox],
             outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
             show_progress="hidden",
         ).then(
