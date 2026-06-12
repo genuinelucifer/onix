@@ -208,7 +208,7 @@ def pick_config_path():
         print(f"File dialog error: {e}")
         return ""
 
-def load_model_handler(checkpoint_path: str, device: str, config_path: str, precision: str, compile_model: bool):
+def load_model_handler(checkpoint_path: str, device: str, config_path: str, precision: str, compile_model: bool, compile_mode: str):
     """Handle model loading from the UI."""
     global _loaded_model, _conversation_history
 
@@ -232,6 +232,8 @@ def load_model_handler(checkpoint_path: str, device: str, config_path: str, prec
         dtype = torch.float16
     elif precision == "float32":
         dtype = torch.float32
+    elif precision in ("int8", "int4"):
+        dtype = precision
 
     try:
         _loaded_model = load_model(
@@ -240,6 +242,7 @@ def load_model_handler(checkpoint_path: str, device: str, config_path: str, prec
             config_path=config_path,
             dtype=dtype,
             compile=compile_model,
+            compile_mode=compile_mode,
         )
         _conversation_history = []
 
@@ -504,7 +507,7 @@ def create_ui():
                 )
                 precision_dropdown = gr.Dropdown(
                     label="Precision Mode",
-                    choices=["float32", "bfloat16", "float16"],
+                    choices=["float32", "bfloat16", "float16", "int8", "int4"],
                     value="float32",
                     interactive=True,
                     scale=2,
@@ -512,6 +515,13 @@ def create_ui():
                 compile_checkbox = gr.Checkbox(
                     label="Compile Model",
                     value=False,
+                    interactive=True,
+                    scale=1,
+                )
+                compile_mode_dropdown = gr.Dropdown(
+                    label="Compile Mode",
+                    choices=["default", "reduce-overhead", "max-autotune"],
+                    value="default",
                     interactive=True,
                     scale=2,
                 )
@@ -668,7 +678,7 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox],
+            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox, compile_mode_dropdown],
             outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
             show_progress="hidden",
         ).then(
@@ -680,7 +690,7 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox],
+            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox, compile_mode_dropdown],
             outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
             show_progress="hidden",
         ).then(
@@ -691,7 +701,7 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox],
+            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox, compile_mode_dropdown],
             outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
             show_progress="hidden",
         ).then(

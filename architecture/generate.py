@@ -68,6 +68,8 @@ def generate(
             context_size = 1024
 
     model.eval()
+    if hasattr(model, "reset_caches"):
+        model.reset_caches()
     import time
 
     if not use_kv_cache:
@@ -78,7 +80,8 @@ def generate(
             for step in range(max_new_tokens):
                 step_start = time.perf_counter()
                 idx_cond = idx[:, -context_size:]
-                logits = model(idx_cond)
+                raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                logits = raw_model(idx_cond)
                 if isinstance(logits, tuple):
                     logits = logits[0]
                 logits = logits[:, -1, :]  # (B, vocab)
@@ -134,32 +137,54 @@ def generate(
         B, T_prompt = idx.shape
         kv_caches = None
         
-        # Position ids for the prefill are 0 ... T_prompt - 1
-        curr_pos = T_prompt
-        position_ids = torch.arange(0, T_prompt, device=idx.device).unsqueeze(0).expand(B, T_prompt)
+        # Check if the model has static caches, unwrapping compiled model if necessary
+        underlying_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+        is_static = (
+            hasattr(underlying_model, "blocks")
+            and len(underlying_model.blocks) > 0
+            and hasattr(underlying_model.blocks[0].attn, "kv_cache")
+            and underlying_model.blocks[0].attn.kv_cache is not None
+        )
+
+        # Pre-allocate output buffer and position IDs to avoid dynamic allocations in the decode loop
+        prefill_len = min(T_prompt, context_size)
+        total_len = prefill_len + max_new_tokens
         
-        # Crop prompt to context size if it's too long
-        if T_prompt > context_size:
-            idx_input = idx[:, -context_size:]
-            position_ids = position_ids[:, -context_size:]
-            curr_pos = context_size
-        else:
-            idx_input = idx
+        out_idx = torch.empty((B, total_len), dtype=torch.long, device=idx.device)
+        out_idx[:, :prefill_len] = idx[:, -prefill_len:]
+        
+        all_position_ids = torch.arange(total_len, device=idx.device).unsqueeze(0).expand(B, total_len)
+
+        # Position ids and input for the prefill
+        position_ids = all_position_ids[:, :prefill_len]
+        idx_input = out_idx[:, :prefill_len]
 
         # Run first step to prefill cache (Measure TTFT)
         t0 = time.perf_counter()
-        res = model(idx_input, position_ids=position_ids, use_cache=True)
-        logits, kv_caches = res[0], res[1]
+        if is_static:
+            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            res = raw_model(idx_input, position_ids=position_ids, use_cache=True)
+            logits = res[0] if isinstance(res, tuple) else res
+            kv_caches = None
+        else:
+            res = model(idx_input, position_ids=position_ids, use_cache=True)
+            logits, kv_caches = res[0], res[1]
+            
         logits = logits[:, -1, :]  # shape (B, vocab_size)
         ttft = time.perf_counter() - t0
         if metrics is not None:
             metrics["ttft"] = ttft
 
         decode_start = time.perf_counter()
+        t_sample_total = 0.0
+        t_overhead_total = 0.0
+        t_forward_total = 0.0
+
         for step in range(max_new_tokens):
+            t_step_start = time.perf_counter()
             # Apply repetition penalty
             if repetition_penalty != 1.0:
-                for token_id in set(idx[0].tolist()):
+                for token_id in set(out_idx[0, :prefill_len + step].tolist()):
                     if logits[0, token_id] > 0:
                         logits[0, token_id] /= repetition_penalty
                     else:
@@ -188,13 +213,17 @@ def generate(
                 idx_next = torch.argmax(logits, dim=-1, keepdim=True)
 
             if eos_id is not None and idx_next.item() == eos_id:
+                t_sample_total += (time.perf_counter() - t_step_start)
                 break
+            t_sample_total += (time.perf_counter() - t_step_start)
 
-            # Append the next token to total sequence
-            idx = torch.cat((idx, idx_next), dim=1)
+            t_ov_start = time.perf_counter()
+            # Write token in-place to pre-allocated output buffer
+            curr_idx = prefill_len + step
+            out_idx[:, curr_idx : curr_idx + 1] = idx_next
 
-            # Crop the KV caches if they exceed context_size - 1
-            if kv_caches is not None:
+            # Crop the KV caches if they exceed context_size - 1 (only for dynamic cache)
+            if not is_static and kv_caches is not None:
                 cache_seq_len = kv_caches[0][0].shape[-2]
                 if cache_seq_len >= context_size - 1:
                     keep = context_size - 1
@@ -203,20 +232,33 @@ def generate(
                         for k, v in kv_caches
                     ]
 
-            # Prepare inputs for the decode step (only the new token)
-            position_ids = torch.tensor([[curr_pos]], device=idx.device)
-            curr_pos += 1
+            # Prepare inputs for the decode step (slice pre-allocated position IDs)
+            position_ids = all_position_ids[:, curr_idx : curr_idx + 1]
+            t_overhead_total += (time.perf_counter() - t_ov_start)
 
+            t_fw_start = time.perf_counter()
             # Run decode step
-            res = model(idx_next, position_ids=position_ids, kv_caches=kv_caches, use_cache=True)
-            logits, kv_caches = res[0], res[1]
+            if is_static:
+                res = model(idx_next, position_ids=position_ids, use_cache=True)
+                logits = res[0] if isinstance(res, tuple) else res
+            else:
+                res = model(idx_next, position_ids=position_ids, kv_caches=kv_caches, use_cache=True)
+                logits, kv_caches = res[0], res[1]
             logits = logits[:, -1, :]
+            t_forward_total += (time.perf_counter() - t_fw_start)
 
         decode_time = time.perf_counter() - decode_start
         if metrics is not None:
             metrics["decode_time"] = decode_time
+            metrics["forward_time"] = t_forward_total
+            metrics["sample_time"] = t_sample_total
+            metrics["overhead_time"] = t_overhead_total
 
-    return idx
+        if max_new_tokens == 0:
+            return out_idx[:, :prefill_len]
+
+        final_len = prefill_len + step if (eos_id is not None and idx_next.item() == eos_id) else total_len
+        return out_idx[:, :final_len]
 
 
 def generate_from_config(
@@ -279,7 +321,8 @@ def generate_image(
         image_tensor: (1, C, H, W) reconstructed image in [-1, 1]
         visual_tokens: (1, num_visual_tokens) generated token indices
     """
-    device = next(model.parameters()).device
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    device = next(raw_model.parameters()).device
 
     # Step 1: Tokenize text
     text_tokens = tokenizer.encode(text_prompt)
@@ -295,13 +338,13 @@ def generate_image(
     num_visual = mm_config.num_visual_tokens
     context_size = mm_config.max_seq_length
 
-    model.eval()
+    raw_model.eval()
     visual_token_ids = []
     with torch.no_grad():
         for _ in range(num_visual):
             # Crop to context window
             idx_cond = idx[:, -context_size:]
-            logits = model(idx_cond)[:, -1, :]  # (1, vocab_size)
+            logits = raw_model(idx_cond)[:, -1, :]  # (1, vocab_size)
 
             # Restrict sampling to visual token range only
             # Zero out logits for non-visual tokens

@@ -19,6 +19,8 @@ from typing import Optional, List, Tuple
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
@@ -65,6 +67,136 @@ class GenerationParams:
     repetition_penalty: float = 1.1
     eos_id: Optional[int] = None
     use_kv_cache: bool = True
+
+
+# ---------------------------------------------------------------------------
+#  In-memory Weight-Only Quantization (INT8 & INT4)
+# ---------------------------------------------------------------------------
+
+class WeightOnlyInt8Linear(nn.Module):
+    """In-memory Weight-only 8-bit Linear Layer (W8A16/W8A32)"""
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("qweight", torch.zeros((out_features, in_features), dtype=torch.int8, device=device))
+        self.register_buffer("scale", torch.zeros((out_features, 1), dtype=dtype, device=device))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def from_float(cls, float_linear: nn.Linear, dtype=torch.float16):
+        device = float_linear.weight.device
+        w = float_linear.weight.detach()
+        
+        # Calculate channel-wise scales
+        max_val = torch.max(torch.abs(w), dim=1, keepdim=True).values.clamp(min=1e-5)
+        scale = max_val / 127.0
+        
+        # Quantize to int8
+        qweight = torch.clamp(torch.round(w / scale), -128, 127).to(torch.int8)
+        
+        qlinear = cls(
+            in_features=float_linear.in_features,
+            out_features=float_linear.out_features,
+            bias=(float_linear.bias is not None),
+            device=device,
+            dtype=dtype
+        )
+        qlinear.qweight.copy_(qweight)
+        qlinear.scale.copy_(scale.to(dtype))
+        if float_linear.bias is not None:
+            qlinear.bias.data.copy_(float_linear.bias.data.to(dtype))
+        return qlinear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dequantized_weight = self.qweight.to(x.dtype) * self.scale
+        return F.linear(x, dequantized_weight, self.bias)
+
+
+class WeightOnlyInt4Linear(nn.Module):
+    """In-memory Packed Weight-only 4-bit Linear Layer (W4A16/W4A32)"""
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        assert in_features % 2 == 0, "in_features must be even for 4-bit packing"
+        self.register_buffer("qweight_packed", torch.zeros((out_features, in_features // 2), dtype=torch.uint8, device=device))
+        self.register_buffer("scale", torch.zeros((out_features, 1), dtype=dtype, device=device))
+        self.register_buffer("zero_point", torch.zeros((out_features, 1), dtype=dtype, device=device))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def from_float(cls, float_linear: nn.Linear, dtype=torch.float16):
+        device = float_linear.weight.device
+        w = float_linear.weight.detach()
+        
+        # Calculate channel-wise scale and zero_point (range [0, 15])
+        min_val = torch.min(w, dim=1, keepdim=True).values
+        max_val = torch.max(w, dim=1, keepdim=True).values
+        scale = (max_val - min_val).clamp(min=1e-5) / 15.0
+        zero_point = min_val
+        
+        # Quantize to [0, 15]
+        qweight = torch.clamp(torch.round((w - zero_point) / scale), 0, 15).to(torch.uint8)
+        
+        # Pack even and odd columns along in_features (dim 1)
+        w_even = qweight[:, 0::2]
+        w_odd = qweight[:, 1::2]
+        qweight_packed = w_even | (w_odd << 4)
+        
+        qlinear = cls(
+            in_features=float_linear.in_features,
+            out_features=float_linear.out_features,
+            bias=(float_linear.bias is not None),
+            device=device,
+            dtype=dtype
+        )
+        qlinear.qweight_packed.copy_(qweight_packed)
+        qlinear.scale.copy_(scale.to(dtype))
+        qlinear.zero_point.copy_(zero_point.to(dtype))
+        if float_linear.bias is not None:
+            qlinear.bias.data.copy_(float_linear.bias.data.to(dtype))
+        return qlinear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        packed = self.qweight_packed
+        
+        # Extract even and odd components
+        w_even = packed & 0x0F
+        w_odd = (packed >> 4) & 0x0F
+        
+        # Interleave columns
+        unpacked = torch.stack([w_even, w_odd], dim=2).view(self.out_features, self.in_features)
+        
+        # Dequantize
+        dequantized_weight = (unpacked.to(x.dtype) * self.scale) + self.zero_point
+        return F.linear(x, dequantized_weight, self.bias)
+
+
+def quantize_model(model: nn.Module, mode: str, target_dtype=torch.float16):
+    """Recursively replace Linear layers (except lm_head) with W8A16 or W4A16 quantized versions."""
+    for name, child in model.named_children():
+        if isinstance(child, nn.Linear):
+            if name == "lm_head":
+                continue
+            if mode == "int4" and child.in_features % 2 != 0:
+                continue
+                
+            if mode == "int8":
+                qlinear = WeightOnlyInt8Linear.from_float(child, dtype=target_dtype)
+            elif mode == "int4":
+                qlinear = WeightOnlyInt4Linear.from_float(child, dtype=target_dtype)
+            else:
+                continue
+            setattr(model, name, qlinear)
+        else:
+            quantize_model(child, mode, target_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +265,7 @@ def load_model(
     config_path: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
     compile: bool = False,
+    compile_mode: str = "default",
 ) -> LoadedModel:
     """
     Load a model from a checkpoint file or model directory.
@@ -166,11 +299,11 @@ def load_model(
     tokenizer = get_tokenizer()
 
     if model_type == "vqvae":
-        return _load_vqvae(ckpt_path, full_config, dev, tokenizer, dtype, compile)
+        return _load_vqvae(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
     elif model_type == "multimodal":
-        return _load_multimodal(ckpt_path, full_config, dev, tokenizer, dtype, compile)
+        return _load_multimodal(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
     elif model_type == "llm":
-        return _load_llm(ckpt_path, full_config, dev, tokenizer, dtype, compile)
+        return _load_llm(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -186,6 +319,7 @@ def _strip_orig_mod_prefix(state_dict: dict) -> dict:
 def _load_vqvae(
     ckpt_path: Path, config: dict, device: torch.device, tokenizer,
     dtype: Optional[torch.dtype] = None, compile: bool = False,
+    compile_mode: str = "default",
 ) -> LoadedModel:
     """Load a VQ-VAE model."""
     vqvae_config = VQVAEConfig.from_dict(config["vqvae"])
@@ -199,11 +333,11 @@ def _load_vqvae(
 
     model.load_state_dict(state_dict, strict=False)
 
-    if dtype is not None:
+    if dtype is not None and not isinstance(dtype, str):
         model = model.to(dtype)
 
     if compile:
-        model = torch.compile(model)
+        model = torch.compile(model, mode=compile_mode)
 
     model.eval()
 
@@ -221,6 +355,7 @@ def _load_vqvae(
 def _load_multimodal(
     ckpt_path: Path, config: dict, device: torch.device, tokenizer,
     dtype: Optional[torch.dtype] = None, compile: bool = False,
+    compile_mode: str = "default",
 ) -> LoadedModel:
     """Load a multimodal model (transformer + frozen VQ-VAE)."""
     mm_config = MultiModalConfig.from_dict(config["multimodal"])
@@ -254,13 +389,29 @@ def _load_multimodal(
 
         frozen_vqvae.load_state_dict(vq_state_dict, strict=False)
 
-    if dtype is not None:
-        model = model.to(dtype)
+    quant_mode = None
+    target_dtype = None
+    if isinstance(dtype, str) and dtype in ("int8", "int4"):
+        quant_mode = dtype
+        target_dtype = torch.float16
+    elif dtype is not None:
+        target_dtype = dtype
+
+    if target_dtype is not None:
+        model = model.to(target_dtype)
         if frozen_vqvae is not None:
-            frozen_vqvae = frozen_vqvae.to(dtype)
+            frozen_vqvae = frozen_vqvae.to(target_dtype)
+
+    if quant_mode is not None:
+        quantize_model(model, quant_mode, target_dtype=target_dtype)
+
+    # Set up static KV cache
+    cache_dtype = target_dtype if target_dtype is not None else torch.float16
+    if hasattr(model, "setup_caches"):
+        model.setup_caches(max_batch_size=1, dtype=cache_dtype)
 
     if compile:
-        model = torch.compile(model)
+        model = torch.compile(model, mode=compile_mode)
 
     model.eval()
     if frozen_vqvae is not None:
@@ -284,6 +435,7 @@ def _load_multimodal(
 def _load_llm(
     ckpt_path: Path, config: dict, device: torch.device, tokenizer,
     dtype: Optional[torch.dtype] = None, compile: bool = False,
+    compile_mode: str = "default",
 ) -> LoadedModel:
     """Load an LLM (CausalLM) model."""
     model_config = ModelConfig.from_dict(config["architecture"])
@@ -302,11 +454,27 @@ def _load_llm(
 
     model.load_state_dict(state_dict, strict=False)
 
-    if dtype is not None:
-        model = model.to(dtype)
+    quant_mode = None
+    target_dtype = None
+    if isinstance(dtype, str) and dtype in ("int8", "int4"):
+        quant_mode = dtype
+        target_dtype = torch.float16
+    elif dtype is not None:
+        target_dtype = dtype
+
+    if target_dtype is not None:
+        model = model.to(target_dtype)
+
+    if quant_mode is not None:
+        quantize_model(model, quant_mode, target_dtype=target_dtype)
+
+    # Set up static KV cache
+    cache_dtype = target_dtype if target_dtype is not None else torch.float16
+    if hasattr(model, "setup_caches"):
+        model.setup_caches(max_batch_size=1, dtype=cache_dtype)
 
     if compile:
-        model = torch.compile(model)
+        model = torch.compile(model, mode=compile_mode)
 
     model.eval()
 

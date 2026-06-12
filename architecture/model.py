@@ -185,6 +185,18 @@ class CausalLM(nn.Module):
             return logits, new_kv_caches
         return logits
 
+    def setup_caches(self, max_batch_size: int, dtype: torch.dtype):
+        """Pre-allocate static KV caches for all attention blocks."""
+        for block in self.blocks:
+            if hasattr(block.attn, "setup_cache"):
+                block.attn.setup_cache(max_batch_size, self.config.context_length, dtype)
+
+    def reset_caches(self):
+        """Reset all static KV caches back to zero."""
+        for block in self.blocks:
+            if hasattr(block.attn, "kv_cache") and block.attn.kv_cache is not None:
+                block.attn.kv_cache.reset()
+
     def param_count(self) -> int:
         """Actual trainable parameter count."""
         return sum(p.numel() for p in self.parameters())

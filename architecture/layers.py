@@ -11,7 +11,7 @@ Includes:
 from __future__ import annotations
 
 import math
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
@@ -94,6 +94,10 @@ class RotaryEmbedding(nn.Module):
             return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
         position_ids = position_ids_or_len
+        # Skip dynamic cache resizing when compiling to prevent graph breaks
+        if torch.compiler.is_compiling():
+            return self.cos_cached[position_ids], self.sin_cached[position_ids]
+
         max_pos = position_ids.max().item()
         if max_pos >= self.max_seq_len:
             self._build_cache(int(max_pos) + 1)
@@ -167,6 +171,32 @@ class ALiBiPositionBias(nn.Module):
         return self.bias[:, :seq_len, :seq_len]
 
 
+class KVCache(nn.Module):
+    """Static Key-Value Cache for optimized inference with torch.compile."""
+
+    def __init__(self, max_batch_size: int, max_seq_len: int, n_kv_heads: int, head_dim: int, device: torch.device, dtype: torch.dtype):
+        super().__init__()
+        self.register_buffer(
+            "k",
+            torch.zeros((max_batch_size, n_kv_heads, max_seq_len, head_dim), dtype=dtype, device=device)
+        )
+        self.register_buffer(
+            "v",
+            torch.zeros((max_batch_size, n_kv_heads, max_seq_len, head_dim), dtype=dtype, device=device)
+        )
+
+    def update(self, input_pos: torch.Tensor, k_val: torch.Tensor, v_val: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input_pos: 1D tensor of position indices to update
+        # k_val, v_val: (batch, n_kv_heads, seq_len, head_dim)
+        self.k[:, :, input_pos] = k_val
+        self.v[:, :, input_pos] = v_val
+        return self.k, self.v
+
+    def reset(self):
+        self.k.zero_()
+        self.v.zero_()
+
+
 # ===========================================================================
 #  Grouped-Query Attention (MHA / MQA / GQA)
 # ===========================================================================
@@ -229,6 +259,24 @@ class GroupedQueryAttention(nn.Module):
             and config.sliding_window is None
         )
 
+    def setup_cache(self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype):
+        # Determine device from parameters or buffers (to support quantized layers)
+        params = list(self.q_proj.parameters())
+        if params:
+            device = params[0].device
+        else:
+            buffers = list(self.q_proj.buffers())
+            device = buffers[0].device if buffers else torch.device("cpu")
+
+        self.kv_cache = KVCache(
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            device=device,
+            dtype=dtype,
+        )
+
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
         """Repeat KV heads to match query head count for GQA."""
         if self.n_rep == 1:
@@ -262,16 +310,33 @@ class GroupedQueryAttention(nn.Module):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # Concatenate keys and values with past caches if present
-        if kv_cache is not None:
-            past_k, past_v = kv_cache
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
+        attn_mask = None
+        if hasattr(self, "kv_cache") and self.kv_cache is not None and use_cache:
+            if position_ids is None:
+                position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+            input_pos = position_ids[0]
+            k, v = self.kv_cache.update(input_pos, k, v)
+            
+            # Slice cache to active sequence length using narrow to avoid attention on padding slots.
+            seq_len = input_pos[-1] + 1
+            k = torch.narrow(k, 2, 0, seq_len)
+            v = torch.narrow(v, 2, 0, seq_len)
+            
+            # Causal mask is only needed for prefill step (T > 1).
+            # For decode (T == 1), all keys up to seq_len are valid history.
+            if T > 1:
+                col_indices = torch.arange(T, device=x.device).view(1, 1, T)
+                mask = col_indices > position_ids.unsqueeze(-1)  # (B, T, T)
+                attn_mask = mask.unsqueeze(1).to(dtype=x.dtype) * -1e9
+        else:
+            if kv_cache is not None:
+                past_k, past_v = kv_cache
+                k = torch.cat([past_k, k], dim=-2)
+                v = torch.cat([past_v, v], dim=-2)
+            S = k.shape[-2]
 
         # Save the new cache if requested
-        new_kv_cache = (k, v) if use_cache else None
-
-        # Total key/value sequence length
-        S = k.shape[-2]
+        new_kv_cache = (k, v) if (use_cache and not (hasattr(self, "kv_cache") and self.kv_cache is not None)) else None
 
         # Expand KV for GQA
         k_for_attn = self._repeat_kv(k)
@@ -280,30 +345,38 @@ class GroupedQueryAttention(nn.Module):
         # Compute attention
         if self._use_sdpa:
             dropout_p = self.attn_dropout_p if self.training else 0.0
-            is_causal = (T > 1)
-            out = F.scaled_dot_product_attention(
-                q, k_for_attn, v_for_attn, is_causal=is_causal, dropout_p=dropout_p,
-            )
+            if attn_mask is not None:
+                out = F.scaled_dot_product_attention(
+                    q, k_for_attn, v_for_attn, attn_mask=attn_mask, dropout_p=dropout_p,
+                )
+            else:
+                is_causal = (T > 1)
+                out = F.scaled_dot_product_attention(
+                    q, k_for_attn, v_for_attn, is_causal=is_causal, dropout_p=dropout_p,
+                )
         else:
             # Manual attention path (needed for ALiBi, sliding window)
             attn = (q @ k_for_attn.transpose(-2, -1)) * self.scale
 
-            # ALiBi bias
-            if self.pos_encoding_type == "alibi":
-                bias = self.alibi(S)
-                attn = attn + bias[:, -T:, :S]
+            if attn_mask is not None:
+                attn = attn + attn_mask
+            else:
+                # ALiBi bias
+                if self.pos_encoding_type == "alibi":
+                    bias = self.alibi(S)
+                    attn = attn + bias[:, -T:, :S]
 
-            # Causal mask
-            if T > 1:
-                attn = attn.masked_fill(self.causal_mask[:T, :S], float("-inf"))
+                # Causal mask
+                if T > 1:
+                    attn = attn.masked_fill(self.causal_mask[:T, :S], float("-inf"))
 
-            # Sliding window mask
-            if self.sliding_window is not None:
-                q_pos = torch.arange(S - T, S, device=x.device)
-                k_pos = torch.arange(S, device=x.device)
-                dist = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
-                window_mask = dist >= self.sliding_window
-                attn = attn.masked_fill(window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                # Sliding window mask
+                if self.sliding_window is not None:
+                    q_pos = torch.arange(S - T, S, device=x.device)
+                    k_pos = torch.arange(S, device=x.device)
+                    dist = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
+                    window_mask = dist >= self.sliding_window
+                    attn = attn.masked_fill(window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
