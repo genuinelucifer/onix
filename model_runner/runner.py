@@ -18,6 +18,14 @@ from typing import Optional, List, Tuple
 # Enable Flash Attention on AMD consumer GPUs before importing PyTorch
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
+# Enable TunableOp for optimal GEMM kernel selection on AMD GPUs.
+# Set PYTORCH_TUNABLEOP_TUNING=1 on first run to generate tuned kernels,
+# then set to 0 for production use with the generated CSV.
+if "PYTORCH_TUNABLEOP_ENABLED" not in os.environ:
+    os.environ["PYTORCH_TUNABLEOP_ENABLED"] = "1"
+if "PYTORCH_TUNABLEOP_TUNING" not in os.environ:
+    os.environ["PYTORCH_TUNABLEOP_TUNING"] = "0"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -259,6 +267,15 @@ def _resolve_checkpoint(path: str) -> Path:
     return p
 
 
+def _remove_dropout(model: nn.Module):
+    """Replace all Dropout(p=0.0) with Identity for cleaner compiled graphs."""
+    for name, child in model.named_children():
+        if isinstance(child, nn.Dropout) and child.p == 0.0:
+            setattr(model, name, nn.Identity())
+        else:
+            _remove_dropout(child)
+
+
 def load_model(
     checkpoint_path: str,
     device: str = "cuda",
@@ -411,6 +428,9 @@ def _load_multimodal(
         model.setup_caches(max_batch_size=1, dtype=cache_dtype)
 
     if compile:
+        _remove_dropout(model)
+        if frozen_vqvae is not None:
+            _remove_dropout(frozen_vqvae)
         model = torch.compile(model, mode=compile_mode)
 
     model.eval()
@@ -474,6 +494,7 @@ def _load_llm(
         model.setup_caches(max_batch_size=1, dtype=cache_dtype)
 
     if compile:
+        _remove_dropout(model)
         model = torch.compile(model, mode=compile_mode)
 
     model.eval()

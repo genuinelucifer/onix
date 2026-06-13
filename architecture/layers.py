@@ -34,9 +34,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.sqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        x_norm = x.float() / rms
-        return (self.weight * x_norm).type_as(x)
+        # Use fused kernel when available (avoids FP32 materialization overhead)
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
+        # Fallback: single FP32 cast (avoid double-cast from original impl)
+        x_fp32 = x.float()
+        rms = torch.sqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight * (x_fp32 / rms)).type_as(x)
 
 
 class LayerNorm(nn.Module):
@@ -311,7 +315,8 @@ class GroupedQueryAttention(nn.Module):
 
         # Concatenate keys and values with past caches if present
         attn_mask = None
-        if hasattr(self, "kv_cache") and self.kv_cache is not None and use_cache:
+        _using_static_cache = hasattr(self, "kv_cache") and self.kv_cache is not None and use_cache
+        if _using_static_cache:
             if position_ids is None:
                 position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
             input_pos = position_ids[0]
@@ -322,12 +327,17 @@ class GroupedQueryAttention(nn.Module):
             k = torch.narrow(k, 2, 0, seq_len)
             v = torch.narrow(v, 2, 0, seq_len)
             
-            # Causal mask is only needed for prefill step (T > 1).
-            # For decode (T == 1), all keys up to seq_len are valid history.
-            if T > 1:
-                col_indices = torch.arange(T, device=x.device).view(1, 1, T)
-                mask = col_indices > position_ids.unsqueeze(-1)  # (B, T, T)
-                attn_mask = mask.unsqueeze(1).to(dtype=x.dtype) * -1e9
+            # Build causal mask for prefill (T > 1).
+            # For decode (T == 1), attn_mask stays None — single query attends to all keys.
+            # We use statically_known_true to avoid a data-dependent guard that breaks fullgraph.
+            if not torch.compiler.is_compiling():
+                # Eager mode: use normal Python branch
+                if T > 1:
+                    col_indices = torch.arange(T, device=x.device).view(1, 1, T)
+                    mask = col_indices > position_ids.unsqueeze(-1)  # (B, T, T)
+                    attn_mask = mask.unsqueeze(1).to(dtype=x.dtype) * -1e9
+            # When compiling, T is always 1 (decode step) since prefill runs uncompiled,
+            # so attn_mask stays None — no guard needed.
         else:
             if kv_cache is not None:
                 past_k, past_v = kv_cache
@@ -336,7 +346,7 @@ class GroupedQueryAttention(nn.Module):
             S = k.shape[-2]
 
         # Save the new cache if requested
-        new_kv_cache = (k, v) if (use_cache and not (hasattr(self, "kv_cache") and self.kv_cache is not None)) else None
+        new_kv_cache = (k, v) if (use_cache and not _using_static_cache) else None
 
         # Expand KV for GQA
         k_for_attn = self._repeat_kv(k)
@@ -345,7 +355,13 @@ class GroupedQueryAttention(nn.Module):
         # Compute attention
         if self._use_sdpa:
             dropout_p = self.attn_dropout_p if self.training else 0.0
-            if attn_mask is not None:
+            if _using_static_cache:
+                # Static KV cache path: always pass attn_mask (None for decode, explicit for prefill)
+                # This avoids the data-dependent is_causal=(T>1) guard that breaks fullgraph compilation.
+                out = F.scaled_dot_product_attention(
+                    q, k_for_attn, v_for_attn, attn_mask=attn_mask, dropout_p=dropout_p,
+                )
+            elif attn_mask is not None:
                 out = F.scaled_dot_product_attention(
                     q, k_for_attn, v_for_attn, attn_mask=attn_mask, dropout_p=dropout_p,
                 )

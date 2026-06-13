@@ -72,6 +72,19 @@ def generate(
         model.reset_caches()
     import time
 
+    # Pre-determine sampling function to avoid branching in the hot loop
+    if temperature > 0.0:
+        def _sample(logits):
+            logits = logits / temperature
+            probs = F.softmax(logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+    else:
+        def _sample(logits):
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+    # Pre-create EOS comparison tensor if needed
+    eos_tensor = torch.tensor([eos_id], device=idx.device) if eos_id is not None else None
+
     if not use_kv_cache:
         # Fallback to eager execution without KV cache (original behavior)
         with torch.no_grad():
@@ -86,13 +99,12 @@ def generate(
                     logits = logits[0]
                 logits = logits[:, -1, :]  # (B, vocab)
 
-                # Repetition penalty
+                # Vectorized repetition penalty (no GPU→CPU sync)
                 if repetition_penalty != 1.0:
-                    for token_id in set(idx[0].tolist()):
-                        if logits[0, token_id] > 0:
-                            logits[0, token_id] /= repetition_penalty
-                        else:
-                            logits[0, token_id] *= repetition_penalty
+                    unique_tokens = idx[0].unique()
+                    score = logits[0, unique_tokens]
+                    score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+                    logits[0, unique_tokens] = score
 
                 # Top-k filtering
                 if top_k is not None:
@@ -108,13 +120,7 @@ def generate(
                     sorted_logits[sorted_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
 
-                # Sample or greedy
-                if temperature > 0.0:
-                    logits = logits / temperature
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                else:
-                    idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+                idx_next = _sample(logits)
 
                 if step == 0:
                     ttft = time.perf_counter() - step_start
@@ -122,7 +128,8 @@ def generate(
                         metrics["ttft"] = ttft
                     decode_start = time.perf_counter()
 
-                if eos_id is not None and idx_next.item() == eos_id:
+                # EOS check without GPU→CPU sync
+                if eos_tensor is not None and (idx_next == eos_tensor).any():
                     break
 
                 idx = torch.cat((idx, idx_next), dim=1)
@@ -132,19 +139,9 @@ def generate(
                 metrics["decode_time"] = max(0.0, decode_time)
         return idx
 
-    # KV Cache mode
+    # KV Cache mode (static cache only — dynamic KV cache is not used)
     with torch.no_grad():
         B, T_prompt = idx.shape
-        kv_caches = None
-        
-        # Check if the model has static caches, unwrapping compiled model if necessary
-        underlying_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-        is_static = (
-            hasattr(underlying_model, "blocks")
-            and len(underlying_model.blocks) > 0
-            and hasattr(underlying_model.blocks[0].attn, "kv_cache")
-            and underlying_model.blocks[0].attn.kv_cache is not None
-        )
 
         # Pre-allocate output buffer and position IDs to avoid dynamic allocations in the decode loop
         prefill_len = min(T_prompt, context_size)
@@ -159,16 +156,14 @@ def generate(
         position_ids = all_position_ids[:, :prefill_len]
         idx_input = out_idx[:, :prefill_len]
 
-        # Run first step to prefill cache (Measure TTFT)
+        # Run prefill step through the raw (uncompiled) model to populate KV cache.
+        # Prefill has variable-length inputs with dynamic shapes (narrow, causal masks)
+        # that are incompatible with fullgraph compilation / HIP graph capture.
+        # The compiled model is used only for the fixed-shape decode loop below.
+        raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         t0 = time.perf_counter()
-        if is_static:
-            raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-            res = raw_model(idx_input, position_ids=position_ids, use_cache=True)
-            logits = res[0] if isinstance(res, tuple) else res
-            kv_caches = None
-        else:
-            res = model(idx_input, position_ids=position_ids, use_cache=True)
-            logits, kv_caches = res[0], res[1]
+        res = raw_model(idx_input, position_ids=position_ids, use_cache=True)
+        logits = res[0] if isinstance(res, tuple) else res
             
         logits = logits[:, -1, :]  # shape (B, vocab_size)
         ttft = time.perf_counter() - t0
@@ -179,16 +174,17 @@ def generate(
         t_sample_total = 0.0
         t_overhead_total = 0.0
         t_forward_total = 0.0
+        hit_eos = False
 
         for step in range(max_new_tokens):
             t_step_start = time.perf_counter()
-            # Apply repetition penalty
+
+            # Vectorized repetition penalty (no GPU→CPU sync)
             if repetition_penalty != 1.0:
-                for token_id in set(out_idx[0, :prefill_len + step].tolist()):
-                    if logits[0, token_id] > 0:
-                        logits[0, token_id] /= repetition_penalty
-                    else:
-                        logits[0, token_id] *= repetition_penalty
+                unique_tokens = out_idx[0, :prefill_len + step].unique()
+                score = logits[0, unique_tokens]
+                score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+                logits[0, unique_tokens] = score
 
             # Top-k filtering
             if top_k is not None:
@@ -204,16 +200,12 @@ def generate(
                 sorted_logits[sorted_mask] = float("-inf")
                 logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
 
-            # Sample or greedy
-            if temperature > 0.0:
-                logits = logits / temperature
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-            else:
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+            idx_next = _sample(logits)
 
-            if eos_id is not None and idx_next.item() == eos_id:
+            # EOS check without GPU→CPU sync
+            if eos_tensor is not None and (idx_next == eos_tensor).any():
                 t_sample_total += (time.perf_counter() - t_step_start)
+                hit_eos = True
                 break
             t_sample_total += (time.perf_counter() - t_step_start)
 
@@ -222,28 +214,14 @@ def generate(
             curr_idx = prefill_len + step
             out_idx[:, curr_idx : curr_idx + 1] = idx_next
 
-            # Crop the KV caches if they exceed context_size - 1 (only for dynamic cache)
-            if not is_static and kv_caches is not None:
-                cache_seq_len = kv_caches[0][0].shape[-2]
-                if cache_seq_len >= context_size - 1:
-                    keep = context_size - 1
-                    kv_caches = [
-                        (k[:, :, -keep:, :], v[:, :, -keep:, :])
-                        for k, v in kv_caches
-                    ]
-
             # Prepare inputs for the decode step (slice pre-allocated position IDs)
             position_ids = all_position_ids[:, curr_idx : curr_idx + 1]
             t_overhead_total += (time.perf_counter() - t_ov_start)
 
             t_fw_start = time.perf_counter()
-            # Run decode step
-            if is_static:
-                res = model(idx_next, position_ids=position_ids, use_cache=True)
-                logits = res[0] if isinstance(res, tuple) else res
-            else:
-                res = model(idx_next, position_ids=position_ids, kv_caches=kv_caches, use_cache=True)
-                logits, kv_caches = res[0], res[1]
+            # Run decode step through the model (compiled or not)
+            res = model(idx_next, position_ids=position_ids, use_cache=True)
+            logits = res[0] if isinstance(res, tuple) else res
             logits = logits[:, -1, :]
             t_forward_total += (time.perf_counter() - t_fw_start)
 
@@ -257,7 +235,7 @@ def generate(
         if max_new_tokens == 0:
             return out_idx[:, :prefill_len]
 
-        final_len = prefill_len + step if (eos_id is not None and idx_next.item() == eos_id) else total_len
+        final_len = prefill_len + step if hit_eos else total_len
         return out_idx[:, :final_len]
 
 

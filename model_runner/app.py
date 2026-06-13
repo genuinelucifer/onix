@@ -508,7 +508,7 @@ def create_ui():
                 precision_dropdown = gr.Dropdown(
                     label="Precision Mode",
                     choices=["float32", "bfloat16", "float16", "int8", "int4"],
-                    value="float32",
+                    value="float16",
                     interactive=True,
                     scale=2,
                 )
