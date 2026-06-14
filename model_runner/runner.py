@@ -283,6 +283,7 @@ def load_model(
     dtype: Optional[torch.dtype] = None,
     compile: bool = False,
     compile_mode: str = "default",
+    context_size: Optional[int] = None,
 ) -> LoadedModel:
     """
     Load a model from a checkpoint file or model directory.
@@ -318,9 +319,9 @@ def load_model(
     if model_type == "vqvae":
         return _load_vqvae(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
     elif model_type == "multimodal":
-        return _load_multimodal(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
+        return _load_multimodal(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode, context_size)
     elif model_type == "llm":
-        return _load_llm(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
+        return _load_llm(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode, context_size)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -373,6 +374,7 @@ def _load_multimodal(
     ckpt_path: Path, config: dict, device: torch.device, tokenizer,
     dtype: Optional[torch.dtype] = None, compile: bool = False,
     compile_mode: str = "default",
+    context_size: Optional[int] = None,
 ) -> LoadedModel:
     """Load a multimodal model (transformer + frozen VQ-VAE)."""
     mm_config = MultiModalConfig.from_dict(config["multimodal"])
@@ -425,7 +427,7 @@ def _load_multimodal(
     # Set up static KV cache
     cache_dtype = target_dtype if target_dtype is not None else torch.float16
     if hasattr(model, "setup_caches"):
-        model.setup_caches(max_batch_size=1, dtype=cache_dtype)
+        model.setup_caches(max_batch_size=1, dtype=cache_dtype, context_length=context_size)
 
     if compile:
         _remove_dropout(model)
@@ -456,6 +458,7 @@ def _load_llm(
     ckpt_path: Path, config: dict, device: torch.device, tokenizer,
     dtype: Optional[torch.dtype] = None, compile: bool = False,
     compile_mode: str = "default",
+    context_size: Optional[int] = None,
 ) -> LoadedModel:
     """Load an LLM (CausalLM) model."""
     model_config = ModelConfig.from_dict(config["architecture"])
@@ -491,7 +494,7 @@ def _load_llm(
     # Set up static KV cache
     cache_dtype = target_dtype if target_dtype is not None else torch.float16
     if hasattr(model, "setup_caches"):
-        model.setup_caches(max_batch_size=1, dtype=cache_dtype)
+        model.setup_caches(max_batch_size=1, dtype=cache_dtype, context_length=context_size)
 
     if compile:
         _remove_dropout(model)
@@ -617,7 +620,7 @@ def run_llm_inference(
 
     tokenizer = loaded.tokenizer
     model = loaded.model
-    ctx_size = loaded.model_config.context_length
+    ctx_size = getattr(model, "active_context_length", loaded.model_config.context_length)
 
     # Tokenize input
     input_ids = text_to_token_ids(conversation_text, tokenizer).to(loaded.device)

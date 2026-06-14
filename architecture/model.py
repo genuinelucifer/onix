@@ -87,6 +87,7 @@ class CausalLM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.active_context_length = config.context_length
 
         # Token embedding
         self.tok_emb = nn.Embedding(config.vocab_size, config.emb_dim)
@@ -185,11 +186,12 @@ class CausalLM(nn.Module):
             return logits, new_kv_caches
         return logits
 
-    def setup_caches(self, max_batch_size: int, dtype: torch.dtype):
+    def setup_caches(self, max_batch_size: int, dtype: torch.dtype, context_length: Optional[int] = None):
         """Pre-allocate static KV caches for all attention blocks."""
+        self.active_context_length = context_length if context_length is not None else self.config.context_length
         for block in self.blocks:
             if hasattr(block.attn, "setup_cache"):
-                block.attn.setup_cache(max_batch_size, self.config.context_length, dtype)
+                block.attn.setup_cache(max_batch_size, self.active_context_length, dtype)
 
     def reset_caches(self):
         """Reset all static KV caches back to zero."""

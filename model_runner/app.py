@@ -208,7 +208,15 @@ def pick_config_path():
         print(f"File dialog error: {e}")
         return ""
 
-def load_model_handler(checkpoint_path: str, device: str, config_path: str, precision: str, compile_model: bool, compile_mode: str):
+def load_model_handler(
+    checkpoint_path: str,
+    device: str,
+    config_path: str,
+    precision: str,
+    compile_model: bool,
+    compile_mode: str,
+    context_size: int
+):
     """Handle model loading from the UI."""
     global _loaded_model, _conversation_history
 
@@ -243,6 +251,7 @@ def load_model_handler(checkpoint_path: str, device: str, config_path: str, prec
             dtype=dtype,
             compile=compile_model,
             compile_mode=compile_mode,
+            context_size=context_size,
         )
         _conversation_history = []
 
@@ -512,6 +521,13 @@ def create_ui():
                     interactive=True,
                     scale=2,
                 )
+                context_size_dropdown = gr.Dropdown(
+                    label="Context Size",
+                    choices=[256, 512, 1024, 2048, 4096, 8192],
+                    value=1024,
+                    interactive=True,
+                    scale=2,
+                )
                 compile_checkbox = gr.Checkbox(
                     label="Compile Model",
                     value=False,
@@ -678,31 +694,52 @@ def create_ui():
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox, compile_mode_dropdown],
-            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            inputs=[
+                checkpoint_input, device_dropdown, config_input,
+                precision_dropdown, compile_checkbox,
+                compile_mode_dropdown, context_size_dropdown
+            ],
+            outputs=[
+                model_status, model_info_html, vqvae_section,
+                multimodal_section, llm_section
+            ],
             show_progress="hidden",
         ).then(
             fn=lambda: None, js=JS_HIDE_OVERLAY
         )
-        
+
         # Also load on enter key in path input
         checkpoint_input.submit(
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox, compile_mode_dropdown],
-            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            inputs=[
+                checkpoint_input, device_dropdown, config_input,
+                precision_dropdown, compile_checkbox,
+                compile_mode_dropdown, context_size_dropdown
+            ],
+            outputs=[
+                model_status, model_info_html, vqvae_section,
+                multimodal_section, llm_section
+            ],
             show_progress="hidden",
         ).then(
             fn=lambda: None, js=JS_HIDE_OVERLAY
         )
-        
+
         config_input.submit(
             fn=lambda: None, js=JS_SHOW_OVERLAY
         ).then(
             fn=load_model_handler,
-            inputs=[checkpoint_input, device_dropdown, config_input, precision_dropdown, compile_checkbox, compile_mode_dropdown],
-            outputs=[model_status, model_info_html, vqvae_section, multimodal_section, llm_section],
+            inputs=[
+                checkpoint_input, device_dropdown, config_input,
+                precision_dropdown, compile_checkbox,
+                compile_mode_dropdown, context_size_dropdown
+            ],
+            outputs=[
+                model_status, model_info_html, vqvae_section,
+                multimodal_section, llm_section
+            ],
             show_progress="hidden",
         ).then(
             fn=lambda: None, js=JS_HIDE_OVERLAY
@@ -729,13 +766,6 @@ def create_ui():
             outputs=[mm_output, mm_status],
         )
 
-        # LLM Chat
-        chat_inputs = [
-            chat_input, chatbot,
-            llm_temp, llm_topk, llm_topp,
-            llm_max_tokens, llm_rep_penalty,
-        ]
-        
         # User step: Add msg, clear + disable input
         chat_send.click(
             fn=llm_user_add,
@@ -744,7 +774,10 @@ def create_ui():
             show_progress="minimal",
         ).then(
             fn=llm_bot_gen,
-            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty, llm_use_kv_cache],
+            inputs=[
+                chatbot, llm_temp, llm_topk, llm_topp,
+                llm_max_tokens, llm_rep_penalty, llm_use_kv_cache
+            ],
             outputs=[chatbot, chat_input, llm_tps_output, llm_ttft_output],
             show_progress="minimal",
         )
@@ -755,7 +788,10 @@ def create_ui():
             show_progress="minimal",
         ).then(
             fn=llm_bot_gen,
-            inputs=[chatbot, llm_temp, llm_topk, llm_topp, llm_max_tokens, llm_rep_penalty, llm_use_kv_cache],
+            inputs=[
+                chatbot, llm_temp, llm_topk, llm_topp,
+                llm_max_tokens, llm_rep_penalty, llm_use_kv_cache
+            ],
             outputs=[chatbot, chat_input, llm_tps_output, llm_ttft_output],
             show_progress="minimal",
         )

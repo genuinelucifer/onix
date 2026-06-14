@@ -104,6 +104,12 @@ def benchmark():
         action="store_true",
         help="Run torch._dynamo.explain to diagnose compilation and check for graph breaks"
     )
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=None,
+        help="Override model's maximum context length during benchmark (default: use config value)"
+    )
     args = parser.parse_args()
 
     # Resolve paths relative to project root
@@ -164,7 +170,7 @@ def benchmark():
         tokenizer = loaded.tokenizer
 
         if hasattr(model, "setup_caches"):
-            model.setup_caches(max_batch_size=1, dtype=torch.float16)
+            model.setup_caches(max_batch_size=1, dtype=torch.float16, context_length=args.context_size)
 
         print("Compiling model for diagnostics...")
         compiled_model = torch.compile(model, mode=args.compile_mode)
@@ -194,14 +200,15 @@ def benchmark():
             device=device,
             dtype=dtype_arg,
             compile=compile_arg,
-            compile_mode=args.compile_mode
+            compile_mode=args.compile_mode,
+            context_size=args.context_size
         )
         t_load = time.perf_counter() - t_load_start
         print(f"Model loaded in {t_load:.2f}s")
 
         tokenizer = loaded.tokenizer
         model = loaded.model
-        ctx_size = loaded.model_config.context_length
+        ctx_size = getattr(model, "active_context_length", loaded.model_config.context_length)
 
         # Tokenize prompt
         input_ids = text_to_token_ids(prompt, tokenizer).to(device)
