@@ -215,7 +215,8 @@ def load_model_handler(
     precision: str,
     compile_model: bool,
     compile_mode: str,
-    context_size: int
+    context_size: int,
+    kv_quant_mode: str,
 ):
     """Handle model loading from the UI."""
     global _loaded_model, _conversation_history
@@ -240,7 +241,7 @@ def load_model_handler(
         dtype = torch.float16
     elif precision == "float32":
         dtype = torch.float32
-    elif precision in ("int8", "int4"):
+    elif precision in ("int8", "int4", "awq_int4"):
         dtype = precision
 
     try:
@@ -252,6 +253,7 @@ def load_model_handler(
             compile=compile_model,
             compile_mode=compile_mode,
             context_size=context_size,
+            kv_quant_mode=kv_quant_mode,
         )
         _conversation_history = []
 
@@ -516,7 +518,7 @@ def create_ui():
                 )
                 precision_dropdown = gr.Dropdown(
                     label="Precision Mode",
-                    choices=["float32", "bfloat16", "float16", "int8", "int4"],
+                    choices=["float32", "bfloat16", "float16", "int8", "int4", "awq_int4"],
                     value="float16",
                     interactive=True,
                     scale=2,
@@ -538,6 +540,13 @@ def create_ui():
                     label="Compile Mode",
                     choices=["default", "reduce-overhead", "max-autotune"],
                     value="default",
+                    interactive=True,
+                    scale=2,
+                )
+                kv_quant_dropdown = gr.Dropdown(
+                    label="KV Cache Quant",
+                    choices=["none", "fp8", "turboquant", "kivi"],
+                    value="none",
                     interactive=True,
                     scale=2,
                 )
@@ -697,7 +706,8 @@ def create_ui():
             inputs=[
                 checkpoint_input, device_dropdown, config_input,
                 precision_dropdown, compile_checkbox,
-                compile_mode_dropdown, context_size_dropdown
+                compile_mode_dropdown, context_size_dropdown,
+                kv_quant_dropdown,
             ],
             outputs=[
                 model_status, model_info_html, vqvae_section,
@@ -716,7 +726,8 @@ def create_ui():
             inputs=[
                 checkpoint_input, device_dropdown, config_input,
                 precision_dropdown, compile_checkbox,
-                compile_mode_dropdown, context_size_dropdown
+                compile_mode_dropdown, context_size_dropdown,
+                kv_quant_dropdown,
             ],
             outputs=[
                 model_status, model_info_html, vqvae_section,
@@ -734,7 +745,8 @@ def create_ui():
             inputs=[
                 checkpoint_input, device_dropdown, config_input,
                 precision_dropdown, compile_checkbox,
-                compile_mode_dropdown, context_size_dropdown
+                compile_mode_dropdown, context_size_dropdown,
+                kv_quant_dropdown,
             ],
             outputs=[
                 model_status, model_info_html, vqvae_section,

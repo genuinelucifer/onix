@@ -38,6 +38,7 @@ def generate(
     eos_id: Optional[int] = None,
     use_kv_cache: bool = True,
     metrics: Optional[dict] = None,
+    speculative_mode: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Generate tokens autoregressively.
@@ -54,10 +55,30 @@ def generate(
         eos_id: stop generation when this token is produced
         use_kv_cache: whether to use key-value caching
         metrics: dict to collect execution times (ttft, decode_time)
+        speculative_mode: "medusa" for Medusa speculative decoding, or None
 
     Returns:
         (1, seq_len + generated) token ids
     """
+    # Dispatch to speculative decoding if requested
+    if speculative_mode == "medusa":
+        from .medusa import medusa_generate
+        if context_size is None:
+            raw = model.base_model._orig_mod if hasattr(model.base_model, "_orig_mod") else model.base_model
+            context_size = getattr(raw.config, "context_length", 2048)
+        return medusa_generate(
+            medusa_model=model,
+            idx=idx,
+            max_new_tokens=max_new_tokens,
+            context_size=context_size,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            eos_id=eos_id,
+            metrics=metrics,
+        )
+
     # Auto-detect context size
     if context_size is None:
         if hasattr(model, "config"):

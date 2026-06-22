@@ -26,6 +26,26 @@ if "PYTORCH_TUNABLEOP_ENABLED" not in os.environ:
 if "PYTORCH_TUNABLEOP_TUNING" not in os.environ:
     os.environ["PYTORCH_TUNABLEOP_TUNING"] = "0"
 
+# Enable C++ wrapper mode for Inductor — reduces Python dispatch overhead
+# in the compiled decode loop by generating C++ kernel dispatch code.
+try:
+    import torch
+    # For ROCm/HIP builds, PyTorch requires CUDA_HOME to point to the ROCm SDK root
+    # in order to locate HIP headers for compilation.
+    if hasattr(torch.version, "hip") and torch.version.hip:
+        if "CUDA_HOME" not in os.environ:
+            rocm_home = os.environ.get("ROCM_HOME", "/opt/rocm")
+            if os.path.isdir(rocm_home):
+                os.environ["CUDA_HOME"] = rocm_home
+
+    # Only enable cpp_wrapper if CUDA_HOME is available in ROCm environments,
+    # preventing compilation errors if the ROCm SDK is not installed.
+    if not (hasattr(torch.version, "hip") and torch.version.hip and "CUDA_HOME" not in os.environ):
+        import torch._inductor.config
+        torch._inductor.config.cpp_wrapper = True
+except (ImportError, AttributeError):
+    pass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -187,8 +207,20 @@ class WeightOnlyInt4Linear(nn.Module):
         return F.linear(x, dequantized_weight, self.bias)
 
 
-def quantize_model(model: nn.Module, mode: str, target_dtype=torch.float16):
-    """Recursively replace Linear layers (except lm_head) with W8A16 or W4A16 quantized versions."""
+def quantize_model(model: nn.Module, mode: str, target_dtype=torch.float16, tokenizer=None, device=None):
+    """Recursively replace Linear layers (except lm_head) with quantized versions."""
+    if mode == "awq_int4":
+        # AWQ: Activation-aware Weight Quantization
+        from model_runner.awq import calibrate_model, awq_quantize_model
+        if tokenizer is None or device is None:
+            raise ValueError("AWQ quantization requires tokenizer and device for calibration")
+        print("[AWQ] Running calibration (collecting activation statistics)...")
+        activation_stats = calibrate_model(model, tokenizer, device)
+        print(f"[AWQ] Calibrated {len(activation_stats)} layers. Applying AWQ INT4 quantization...")
+        awq_quantize_model(model, activation_stats, target_dtype=target_dtype)
+        print("[AWQ] Quantization complete.")
+        return
+
     for name, child in model.named_children():
         if isinstance(child, nn.Linear):
             if name == "lm_head":
@@ -284,6 +316,9 @@ def load_model(
     compile: bool = False,
     compile_mode: str = "default",
     context_size: Optional[int] = None,
+    kv_quant_mode: str = "none",
+    precompiled_path: Optional[str] = None,
+    medusa_heads_path: Optional[str] = None,
 ) -> LoadedModel:
     """
     Load a model from a checkpoint file or model directory.
@@ -296,6 +331,11 @@ def load_model(
         config_path: Optional manual path to config.json
         dtype: Optional torch.dtype to cast model weights to
         compile: Whether to run torch.compile on the model
+        compile_mode: torch.compile mode ("default", "reduce-overhead", "max-autotune")
+        context_size: Override model context length
+        kv_quant_mode: KV cache quantization ("none", "fp8", "turboquant", "kivi")
+        precompiled_path: Path to AOTInductor .so file (skips torch.compile)
+        medusa_heads_path: Path to trained Medusa heads checkpoint
 
     Returns:
         LoadedModel with the model ready for inference
@@ -319,9 +359,17 @@ def load_model(
     if model_type == "vqvae":
         return _load_vqvae(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode)
     elif model_type == "multimodal":
-        return _load_multimodal(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode, context_size)
+        return _load_multimodal(
+            ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode, context_size,
+            kv_quant_mode=kv_quant_mode,
+        )
     elif model_type == "llm":
-        return _load_llm(ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode, context_size)
+        return _load_llm(
+            ckpt_path, full_config, dev, tokenizer, dtype, compile, compile_mode, context_size,
+            kv_quant_mode=kv_quant_mode,
+            precompiled_path=precompiled_path,
+            medusa_heads_path=medusa_heads_path,
+        )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -375,6 +423,7 @@ def _load_multimodal(
     dtype: Optional[torch.dtype] = None, compile: bool = False,
     compile_mode: str = "default",
     context_size: Optional[int] = None,
+    kv_quant_mode: str = "none",
 ) -> LoadedModel:
     """Load a multimodal model (transformer + frozen VQ-VAE)."""
     mm_config = MultiModalConfig.from_dict(config["multimodal"])
@@ -410,7 +459,7 @@ def _load_multimodal(
 
     quant_mode = None
     target_dtype = None
-    if isinstance(dtype, str) and dtype in ("int8", "int4"):
+    if isinstance(dtype, str) and dtype in ("int8", "int4", "awq_int4"):
         quant_mode = dtype
         target_dtype = torch.float16
     elif dtype is not None:
@@ -422,12 +471,15 @@ def _load_multimodal(
             frozen_vqvae = frozen_vqvae.to(target_dtype)
 
     if quant_mode is not None:
-        quantize_model(model, quant_mode, target_dtype=target_dtype)
+        quantize_model(model, quant_mode, target_dtype=target_dtype, tokenizer=tokenizer, device=device)
 
-    # Set up static KV cache
+    # Set up static KV cache with optional quantization
     cache_dtype = target_dtype if target_dtype is not None else torch.float16
     if hasattr(model, "setup_caches"):
-        model.setup_caches(max_batch_size=1, dtype=cache_dtype, context_length=context_size)
+        model.setup_caches(
+            max_batch_size=1, dtype=cache_dtype, context_length=context_size,
+            kv_quant_mode=kv_quant_mode,
+        )
 
     if compile:
         _remove_dropout(model)
@@ -459,6 +511,9 @@ def _load_llm(
     dtype: Optional[torch.dtype] = None, compile: bool = False,
     compile_mode: str = "default",
     context_size: Optional[int] = None,
+    kv_quant_mode: str = "none",
+    precompiled_path: Optional[str] = None,
+    medusa_heads_path: Optional[str] = None,
 ) -> LoadedModel:
     """Load an LLM (CausalLM) model."""
     model_config = ModelConfig.from_dict(config["architecture"])
@@ -479,7 +534,7 @@ def _load_llm(
 
     quant_mode = None
     target_dtype = None
-    if isinstance(dtype, str) and dtype in ("int8", "int4"):
+    if isinstance(dtype, str) and dtype in ("int8", "int4", "awq_int4"):
         quant_mode = dtype
         target_dtype = torch.float16
     elif dtype is not None:
@@ -489,18 +544,40 @@ def _load_llm(
         model = model.to(target_dtype)
 
     if quant_mode is not None:
-        quantize_model(model, quant_mode, target_dtype=target_dtype)
+        quantize_model(model, quant_mode, target_dtype=target_dtype, tokenizer=tokenizer, device=device)
 
-    # Set up static KV cache
+    # Set up static KV cache with optional quantization
     cache_dtype = target_dtype if target_dtype is not None else torch.float16
     if hasattr(model, "setup_caches"):
-        model.setup_caches(max_batch_size=1, dtype=cache_dtype, context_length=context_size)
+        model.setup_caches(
+            max_batch_size=1, dtype=cache_dtype, context_length=context_size,
+            kv_quant_mode=kv_quant_mode,
+        )
+
+    # Compilation: prefer AOTInductor pre-compiled model if available
+    if precompiled_path:
+        from model_runner.aot_compiler import load_precompiled
+        precompiled = load_precompiled(precompiled_path)
+        if precompiled is not None:
+            # Store the precompiled function as an attribute for the decode loop
+            model._precompiled_decode = precompiled
+            compile = False  # Skip torch.compile since we have AOT
 
     if compile:
         _remove_dropout(model)
         model = torch.compile(model, mode=compile_mode)
 
     model.eval()
+
+    # Wrap with Medusa heads if provided
+    if medusa_heads_path:
+        from architecture.medusa import MedusaModel
+        medusa_model = MedusaModel(model)
+        medusa_model.load_heads(medusa_heads_path, map_location=str(device))
+        medusa_model.to(device)
+        medusa_model.eval()
+        # Store medusa model reference but keep base model as the primary
+        model._medusa_model = medusa_model
 
     return LoadedModel(
         model_type="llm",

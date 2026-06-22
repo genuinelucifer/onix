@@ -73,6 +73,8 @@ def benchmark():
             "bf16", "compiled_bf16",
             "int8", "compiled_int8",
             "int4", "compiled_int4",
+            "awq_int4", "compiled_awq_int4",
+            "fp8_kv", "turboquant_kv", "kivi_kv",
             "all"
         ],
         help="Benchmark mode to run (default: all)"
@@ -109,6 +111,13 @@ def benchmark():
         type=int,
         default=None,
         help="Override model's maximum context length during benchmark (default: use config value)"
+    )
+    parser.add_argument(
+        "--kv-quant",
+        type=str,
+        default="none",
+        choices=["none", "fp8", "turboquant", "kivi"],
+        help="KV cache quantization mode (default: none)"
     )
     args = parser.parse_args()
 
@@ -190,7 +199,7 @@ def benchmark():
         return
 
     # Helper to run a benchmark
-    def run_benchmark(name, dtype_arg, compile_arg, use_kv_cache):
+    def run_benchmark(name, dtype_arg, compile_arg, use_kv_cache, kv_quant="none"):
         print(f"\n[Benchmarking Mode: {name}]")
         print("Loading model...")
         t_load_start = time.perf_counter()
@@ -201,7 +210,8 @@ def benchmark():
             dtype=dtype_arg,
             compile=compile_arg,
             compile_mode=args.compile_mode,
-            context_size=args.context_size
+            context_size=args.context_size,
+            kv_quant_mode=kv_quant,
         )
         t_load = time.perf_counter() - t_load_start
         print(f"Model loaded in {t_load:.2f}s")
@@ -287,6 +297,11 @@ def benchmark():
         "compiled_int8": ("Compiled Weight-Only INT8", "int8", True, True),
         "int4": ("Weight-Only INT4", "int4", False, True),
         "compiled_int4": ("Compiled Weight-Only INT4", "int4", True, True),
+        "awq_int4": ("AWQ INT4", "awq_int4", False, True),
+        "compiled_awq_int4": ("Compiled AWQ INT4", "awq_int4", True, True),
+        "fp8_kv": ("FP8 KV Cache", torch.float16, False, True, "fp8"),
+        "turboquant_kv": ("TurboQuant KV Cache", torch.float16, False, True, "turboquant"),
+        "kivi_kv": ("KIVI KV Cache", torch.float16, False, True, "kivi"),
     }
 
     try:
@@ -296,8 +311,13 @@ def benchmark():
             modes_to_run = [args.mode]
 
         for m_key in modes_to_run:
-            name, dtype_arg, compile_arg, use_kv_cache = all_modes[m_key]
-            results[name] = run_benchmark(name, dtype_arg, compile_arg, use_kv_cache)
+            mode_info = all_modes[m_key]
+            if len(mode_info) == 5:
+                name, dtype_arg, compile_arg, use_kv_cache, kv_quant = mode_info
+            else:
+                name, dtype_arg, compile_arg, use_kv_cache = mode_info
+                kv_quant = args.kv_quant
+            results[name] = run_benchmark(name, dtype_arg, compile_arg, use_kv_cache, kv_quant=kv_quant)
 
         # Print final comparison table
         print("\n" + "=" * 60)

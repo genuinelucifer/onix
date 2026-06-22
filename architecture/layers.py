@@ -263,7 +263,7 @@ class GroupedQueryAttention(nn.Module):
             and config.sliding_window is None
         )
 
-    def setup_cache(self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype):
+    def setup_cache(self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype, kv_quant_mode: str = "none"):
         # Determine device from parameters or buffers (to support quantized layers)
         params = list(self.q_proj.parameters())
         if params:
@@ -272,7 +272,9 @@ class GroupedQueryAttention(nn.Module):
             buffers = list(self.q_proj.buffers())
             device = buffers[0].device if buffers else torch.device("cpu")
 
-        self.kv_cache = KVCache(
+        from .kv_quant import build_kv_cache
+        self.kv_cache = build_kv_cache(
+            mode=kv_quant_mode,
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             n_kv_heads=self.n_kv_heads,
@@ -358,6 +360,7 @@ class GroupedQueryAttention(nn.Module):
             if _using_static_cache:
                 # Static KV cache path: always pass attn_mask (None for decode, explicit for prefill)
                 # This avoids the data-dependent is_causal=(T>1) guard that breaks fullgraph compilation.
+                torch._check(k_for_attn.shape[2] > 0)
                 out = F.scaled_dot_product_attention(
                     q, k_for_attn, v_for_attn, attn_mask=attn_mask, dropout_p=dropout_p,
                 )
