@@ -1,7 +1,6 @@
 __pycache__/
 datasets/
 models/
-pretrain_data/
 .torch_cache/
 onix_env/
 *.csv

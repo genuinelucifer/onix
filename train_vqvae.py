@@ -32,7 +32,7 @@ try:
 except ImportError:
     HAS_TORCHVISION = False
 
-from pretrain_data.image_dataset import create_image_dataloaders
+from architecture.dataloaders import create_image_dataloaders
 
 from model import (
     write_status, save_model_config, load_model_config,

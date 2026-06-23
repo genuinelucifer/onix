@@ -31,7 +31,7 @@ from architecture.vqvae import VQVAE
 from architecture.losses import masked_cross_entropy, calc_loss_batch_masked
 from architecture.generate import generate_image
 
-from pretrain_data.multimodal_dataset import create_multimodal_dataloaders
+from architecture.dataloaders import create_multimodal_dataloaders
 
 from model import (
     get_tokenizer, write_status, save_model_config, load_model_config,

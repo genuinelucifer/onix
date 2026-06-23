@@ -54,7 +54,7 @@ from training_utils import (
 )
 
 # Data pipeline
-from pretrain_data.dataset import create_pretrain_dataloaders
+from architecture.dataloaders import create_pretrain_dataloaders
 
 
 # ---------------------------------------------------------------------------
